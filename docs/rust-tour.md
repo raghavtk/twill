@@ -1,43 +1,51 @@
 # Rust tour through Twill
 
-This guide explains Rust through the current Twill source. The project compiled and its initial unit-test run passed 7 tests. The guide describes source structure and ownership relationships; it does not claim that every runtime path has been exercised.
+This guide explains Rust through the current Twill source. It describes code structure and selected invariants, not proof that every interactive path has been exercised.
 
 ## Ownership and borrowing: one document, many views
 
-In [`src/app.rs`](../src/app.rs), `Twill` owns `documents: HashMap<u64, Document>` and a `Layout`. Each pane owns tabs of `View` values, and each view stores a document ID. This lets split panes refer to the same document without each view owning a separate copy of its text.
+In [`src/app.rs`](../src/app.rs), `Twill` owns a `HashMap<u64, Document>` and a `Layout`. Each pane owns tabs of `View` values, and each view stores a document ID. Split panes can therefore show the same document without owning separate text copies.
 
-When the app renders, `draw_layout` receives mutable references to the layout and document map. The editor obtains a mutable `Document` for the active view, then calls methods such as `replace`. Rust checks that these mutable borrows do not overlap illegally. This shapes the event flow: UI callbacks collect `Action` values, then the app processes those actions after drawing has finished.
+When the app draws, it passes mutable references to layout and documents. The editor gets the active `Document` and calls methods such as `replace`. Rust checks that these mutable borrows do not overlap illegally. UI callbacks collect `Action` values, and the app processes those actions after drawing, which keeps structural changes outside the active borrows.
 
-The rope helps with text ownership too. `Highlighter::request` in [`src/syntax.rs`](../src/syntax.rs) takes a `Rope` clone and sends it to a worker. Rope clones share internal chunks, so the request does not first create a full duplicate `String` of the document.
+The document text is a `ropey::Rope`. `Highlighter::request` in [`src/syntax.rs`](../src/syntax.rs) takes a Rope clone to send to a worker. Rope clones share their underlying chunks, so this does not first create a full document `String`.
 
 ## Enums make state explicit
 
-`Layout` in `src/app.rs` is either a `Leaf(Pane)` or a `Split` containing two boxed layouts. Recursive layout is represented directly in the type, and `match` handles each shape when finding, splitting, removing, or drawing panes.
+`Layout` in `src/app.rs` is either a `Leaf(Pane)` or a `Split` with two boxed layouts. This recursive type models nested panes directly. `match` handles each shape when searching, splitting, removing, or drawing panes. The command prompt supports `w`, `q`, `q!`, `wq`, and line-number navigation; splits are created through the View menu.
 
-Other examples include `VimMode` (`Normal`, `Insert`, `Visual`, `VisualLine`) in [`src/vim.rs`](../src/vim.rs), and `Shell` (`PowerShell`, `CommandPrompt`, `Wsl`) in [`src/terminal.rs`](../src/terminal.rs). Matching on these enums makes supported states and choices visible to the compiler and reader.
-
-The app's `Action` enum carries UI requests such as opening a path, closing a tab, saving, splitting, searching, or focusing a pane. Collecting these requests separates rendering from mutations that would otherwise conflict with active borrows.
+Other examples include `VimMode` (`Normal`, `Insert`, `Visual`, `VisualLine`) in [`src/vim.rs`](../src/vim.rs), and `Shell` (`PowerShell`, `CommandPrompt`, `Wsl`) in [`src/terminal.rs`](../src/terminal.rs). The app's `Action` enum carries requests such as opening a path, saving, splitting, searching, or focusing a pane. Explicit variants make these supported states visible in the code.
 
 ## `Result` for file and process failures
 
-`Document::open` returns `anyhow::Result<Self>` because reading a file or decoding UTF-8 can fail. `Document::save` and `reload` do the same. Callers decide where to show an error: `Twill::open` stores a message, while `save_id` displays a “Save failed” message and returns `false` so a close flow can remain open.
-
-The `?` operator in `src/document.rs` propagates errors while adding context, for example identifying which path could not be read. This keeps the lower-level document code responsible for describing the failure and the UI responsible for presenting it.
+`Document::open`, `save`, and `reload` return `anyhow::Result` because reading, decoding, writing, or replacing a file can fail. Callers decide how to present errors. The `?` operator propagates failures while adding path context, keeping lower-level file details close to the operation and UI messages in the app.
 
 ## Traits define component boundaries
 
-The application implements `eframe::App` for `Twill` in `src/app.rs`; the framework calls `update` for each UI frame. `Settings` derives Serde's `Serialize` and `Deserialize` traits in `src/platform.rs`, which lets TOML encode and decode its persisted fields. `Terminal` implements `Drop`, so its shutdown method is called when the terminal value is discarded.
-
-These trait implementations connect Twill to framework and library behavior without requiring the app to control those libraries' internal loops or serialization formats.
+`Twill` implements `eframe::App` in `src/app.rs`; the framework calls `update` for each frame. `Settings` derives Serde's `Serialize` and `Deserialize` traits in `src/platform.rs`, so TOML can encode and decode its persisted fields. `Terminal` implements `Drop`, so it shuts down its child process when discarded.
 
 ## Threads and channels move background work
 
-`Highlighter::new` creates standard-library channels and starts a named worker thread. The UI sends `Request` values through a `Sender`; the worker receives them and sends `LineResult` values back through a bounded `SyncSender`. The UI polls results without blocking. Each result carries a document ID and revision, allowing stale work to be discarded.
+`Highlighter::new` creates channels and starts a named worker thread. The UI sends `Document`, `Visible`, and `Forget` messages; the worker returns `LineResult` values through a bounded synchronous channel. Results carry a document ID and revision, which lets the UI discard stale highlighting after edits. The rendered-line cache is capped at 8 MiB of estimated text and section storage. The worker processes work in batches and limits each rendered line to 4,096 characters.
 
-The terminal uses a separate reader thread in `src/terminal.rs`. The UI thread writes to the PTY, while the reader feeds bytes into a shared `vt100::Parser`. `Arc<Mutex<_>>` shares parser state between threads, and an `AtomicBool` communicates whether the reader is still alive. The UI uses `try_lock` so drawing does not wait for the parser lock.
+The terminal has a separate reader thread in `src/terminal.rs`. It reads from the PTY, updates a shared `vt100::Parser`, and detects cursor-position queries even when a query arrives split across output chunks. The app writes the terminal response back to the PTY. `Arc<Mutex<_>>` shares parser state; the UI uses `try_lock` while drawing so it does not wait for the reader's lock.
 
-These are real examples of Rust's thread-safety constraints: values crossing threads must meet the required `Send`/`Sync` bounds, and shared mutable state must use synchronization. They also show a practical tradeoff: bounded/nonblocking UI communication keeps frames responsive, while current lock contention or terminal latency has not yet been measured.
+These are examples of Rust's thread-safety rules: data crossing threads must satisfy `Send` and `Sync` requirements, and shared mutable state needs synchronization. Channels and nonblocking locks help keep UI work responsive, but no latency measurements are documented here.
 
-## Small tests exercise document invariants
+## Literal search and byte offsets
 
-Tests alongside `src/document.rs` check undo state, Unicode grapheme navigation, BOM/newline preservation, and external file modification detection. `src/vim.rs` tests counted line deletion and grouped insert undo. `src/platform.rs` tests settings serialization. These tests explain a few important invariants, but they do not cover the full UI, recovery, or interactive terminal behavior.
+`find_match` in [`src/search.rs`](../src/search.rs) returns byte ranges into the original UTF-8 text. Case-sensitive search uses `match_indices`. Case-insensitive search uses a streaming KMP matcher over Unicode lowercase characters and keeps a query-sized queue mapping folded characters to source byte offsets. This avoids allocating a lowercased copy of the whole document. It also avoids returning a partial range when one source character lowercases to multiple characters.
+
+In `src/app.rs`, `find_bar` uses an optional `FindBarAction` enum to return search, replace, or close requests from the UI callback. Opening the bar requests focus on the query. Enter searches from the query field or replaces from the replacement field. Escape closes the bar whenever it is open and is consumed before the editor handles it, which matters because egui can clear text-field focus before the frame processes the key. Search and replacement rebase stale view positions after edits in another pane. A replacement first accepts a matching selection or finds and replaces the next occurrence from the cursor, then selects the following match. Each replacement is its own undo edit. A UI test checks query focus, typing, Enter, and Escape handling.
+
+## File writes and saved state
+
+`Document::save` streams rope chunks into a temporary sibling file instead of first flattening the rope into one large string. It syncs the temporary file, checks the destination fingerprint again for external changes, and then replaces the destination. The document tracks saved state separately from edit revisions, so undoing back to the saved state clears the dirty marker. The app also retires an obsolete recovery snapshot when undo returns to that state.
+
+Recovery serialization in [`src/platform.rs`](../src/platform.rs) shows how lifetimes and traits work together. `RecoveryRef<'a>` borrows the path, newline string, and `Rope` from a document for the duration of the write. Its `RopeText<'a>` wrapper implements Serde's generic `Serialize` trait by calling `serializer.collect_str` with Ropey's `Display` implementation. With `serde_json::to_writer`, that streams text fragments through JSON escaping into a buffered file writer without allocating one full flattened text string and a second serialized byte vector. After flush and `sync_all`, the completed temporary file replaces the prior snapshot. If serialization fails, cleanup removes the temporary file before rename, preserving the previous snapshot. Tests include Unicode and control-character escaping, CRLF text, BOM metadata, and a serializer that deliberately fails. Snapshot writing still runs synchronously on the UI thread, and its latency has not been measured.
+
+Undo edits live in a `VecDeque<Edit>`. Each edit's budget includes the `Edit` struct itself and the allocated capacities of its before and after strings. Old records are evicted from the front while the 16 MiB limit is exceeded, retaining at least one edit.
+
+## Tests exercise focused invariants
+
+Unit tests in `src/document.rs` cover saved-state undo, grapheme navigation, BOM and newline preservation, external edit detection, and the change journal. `src/search.rs` tests Unicode offset mapping, repeated prefixes, wrapping, and literal matching. `src/terminal.rs` tests key encoding, colors, and cursor-query parsing; a Windows-only integration test starts a real Command Prompt through `Terminal::spawn` and checks output, resize, and shutdown. `src/platform.rs` tests recovery round trips and failure cleanup. `src/syntax.rs` checks the bundled syntax set, rendered line breaks, and worker result handling. The current offline suite passed 37 tests with 0 failures and 0 ignored tests. Formatting, Clippy with warnings denied, and the offline release build passed. These focused tests do not cover every interactive UI workflow, recovery scenario, or shell configuration.

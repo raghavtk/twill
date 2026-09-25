@@ -1,6 +1,7 @@
 use crate::{
     document::{next_grapheme, prev_grapheme, Document},
     platform::{FileWatcher, Recovery, RecoveryStore, Settings},
+    search::find_match,
     syntax::Highlighter,
     terminal::{Shell, Terminal},
     vim::{VimMode, VimState},
@@ -161,6 +162,11 @@ enum Action {
     Find(bool),
     Focus(u64),
 }
+enum FindBarAction {
+    Search(bool),
+    Replace,
+    Close,
+}
 pub struct Twill {
     documents: HashMap<u64, Document>,
     layout: Layout,
@@ -187,6 +193,7 @@ pub struct Twill {
     last_edit: Instant,
     last_poll: Instant,
     find_open: bool,
+    find_focus: bool,
     find: String,
     replacement: String,
     match_case: bool,
@@ -234,6 +241,7 @@ impl Twill {
             last_edit: Instant::now(),
             last_poll: Instant::now(),
             find_open: false,
+            find_focus: false,
             find: String::new(),
             replacement: String::new(),
             match_case: false,
@@ -347,6 +355,7 @@ impl Twill {
                     self.watcher.watch(p);
                 }
                 self.recovery.remove(id);
+                self.recovery_revision.remove(&id);
                 self.conflicts.remove(&id);
                 true
             }
@@ -397,6 +406,7 @@ impl Twill {
         let Some(d) = self.documents.get(&v.document) else {
             return;
         };
+        sync_view(v, d);
         let hay = d.text();
         let start = d.rope.char_to_byte(if backwards {
             selection(v).start.min(d.len())
@@ -412,27 +422,24 @@ impl Twill {
             self.message = Some("No matches".into());
         }
     }
-    fn replace_selection(&mut self) {
-        let Some(p) = self.layout.pane_mut(self.active_pane) else {
+    fn replace_current(&mut self) {
+        if self.find.is_empty() {
             return;
-        };
-        let Some(v) = p.tabs.get_mut(p.active) else {
-            return;
-        };
-        let Some(d) = self.documents.get_mut(&v.document) else {
-            return;
-        };
-        if let Some(a) = v.anchor {
-            let r = a.min(v.cursor)..a.max(v.cursor);
-            let selected = d.slice(r.clone());
-            if selected == self.find
-                || (!self.match_case && selected.to_lowercase() == self.find.to_lowercase())
-            {
-                d.replace(r.clone(), &self.replacement);
-                v.cursor = r.start + self.replacement.chars().count();
-                v.anchor = None;
-                v.observed_revision = d.revision;
-            }
+        }
+        let replaced = self
+            .layout
+            .pane_mut(self.active_pane)
+            .and_then(|p| p.tabs.get_mut(p.active))
+            .and_then(|v| {
+                self.documents.get_mut(&v.document).map(|d| {
+                    replace_next_match(v, d, &self.find, &self.replacement, self.match_case)
+                })
+            })
+            .unwrap_or(false);
+        if replaced {
+            self.search(false);
+        } else {
+            self.message = Some("No matches".into());
         }
     }
     fn command(&mut self, command: String) {
@@ -483,6 +490,73 @@ impl Twill {
     }
 }
 
+fn find_bar(
+    ui: &mut egui::Ui,
+    find: &mut String,
+    replacement: &mut String,
+    match_case: &mut bool,
+    focus: &mut bool,
+) -> Option<FindBarAction> {
+    let enter = ui.input(|i| i.key_pressed(Key::Enter));
+    let escape = ui.input(|i| i.key_pressed(Key::Escape));
+    let query_id = ui.make_persistent_id("find-query");
+    let replacement_id = ui.make_persistent_id("find-replacement");
+    let query_was_focused = ui.memory(|memory| memory.has_focus(query_id));
+    let replacement_was_focused = ui.memory(|memory| memory.has_focus(replacement_id));
+    if enter && (query_was_focused || replacement_was_focused) {
+        ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, Key::Enter));
+    }
+    if escape {
+        ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, Key::Escape));
+    }
+    let mut action = None;
+    ui.horizontal(|ui| {
+        ui.label("Find");
+        let query = ui.add(
+            egui::TextEdit::singleline(find)
+                .id(query_id)
+                .desired_width(180.0),
+        );
+        if *focus {
+            query.request_focus();
+            *focus = false;
+        }
+        ui.checkbox(match_case, "Aa");
+        if ui.button("Previous").clicked() {
+            action = Some(FindBarAction::Search(true));
+        }
+        if ui.button("Next").clicked() {
+            action = Some(FindBarAction::Search(false));
+        }
+        ui.label("Replace");
+        let replacement_edit = ui.add(
+            egui::TextEdit::singleline(replacement)
+                .id(replacement_id)
+                .desired_width(140.0),
+        );
+        if ui.button("Replace").clicked() {
+            action = Some(FindBarAction::Replace);
+        }
+        if ui.button("Close").clicked() {
+            action = Some(FindBarAction::Close);
+        }
+        if escape {
+            action = Some(FindBarAction::Close);
+        } else if enter && query_was_focused {
+            query.request_focus();
+            action = Some(FindBarAction::Search(false));
+        } else if enter && replacement_was_focused {
+            replacement_edit.request_focus();
+            action = Some(FindBarAction::Replace);
+        }
+        if matches!(action, Some(FindBarAction::Close)) {
+            query.surrender_focus();
+            replacement_edit.surrender_focus();
+        }
+    });
+    action
+}
+
 impl eframe::App for Twill {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if ctx.input(|i| i.viewport().close_requested()) && !self.allow_quit {
@@ -519,6 +593,7 @@ impl eframe::App for Twill {
             }
             if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, Key::F)) {
                 self.find_open = true;
+                self.find_focus = true;
             }
             if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, Key::G)) {
                 self.command = Some(String::new());
@@ -603,6 +678,7 @@ impl eframe::App for Twill {
                     }
                     if ui.button("Find / replace").clicked() {
                         self.find_open = true;
+                        self.find_focus = true;
                         ui.close_menu();
                     }
                     ui.checkbox(&mut self.terminal_visible, "Terminal");
@@ -640,29 +716,20 @@ impl eframe::App for Twill {
         });
         if self.find_open {
             egui::TopBottomPanel::top("find").show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label("Find");
-                    let r = ui.add(egui::TextEdit::singleline(&mut self.find).desired_width(180.0));
-                    if r.has_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
-                        actions.push(Action::Find(false));
+                match find_bar(
+                    ui,
+                    &mut self.find,
+                    &mut self.replacement,
+                    &mut self.match_case,
+                    &mut self.find_focus,
+                ) {
+                    Some(FindBarAction::Search(backwards)) => {
+                        actions.push(Action::Find(backwards));
                     }
-                    ui.checkbox(&mut self.match_case, "Aa");
-                    if ui.button("Previous").clicked() {
-                        actions.push(Action::Find(true));
-                    }
-                    if ui.button("Next").clicked() {
-                        actions.push(Action::Find(false));
-                    }
-                    ui.label("Replace");
-                    ui.add(egui::TextEdit::singleline(&mut self.replacement).desired_width(140.0));
-                    if ui.button("Replace").clicked() {
-                        self.replace_selection();
-                        actions.push(Action::Find(false));
-                    }
-                    if ui.button("Close").clicked() {
-                        self.find_open = false;
-                    }
-                });
+                    Some(FindBarAction::Replace) => self.replace_current(),
+                    Some(FindBarAction::Close) => self.find_open = false,
+                    None => {}
+                }
             });
         }
         if self.command.is_some() {
@@ -887,10 +954,21 @@ impl eframe::App for Twill {
             self.last_poll = Instant::now();
             self.tree_cache.clear();
             for (id, d) in &mut self.documents {
-                if d.external_changed() {
-                    if d.is_dirty() || d.reload().is_err() {
-                        self.conflicts.insert(*id);
+                if d.external_changed() && (d.is_dirty() || d.reload().is_err()) {
+                    self.conflicts.insert(*id);
+                }
+            }
+        }
+        // Undoing back to the saved state must also retire its earlier dirty snapshot.
+        // Do this before close dialogs can allow an otherwise clean application to exit.
+        for (id, document) in &self.documents {
+            if !document.is_dirty() && self.recovery_revision.contains_key(id) {
+                match self.recovery.discard_if_saved(document) {
+                    Ok(true) => {
+                        self.recovery_revision.remove(id);
                     }
+                    Err(error) => self.message = Some(format!("Recovery cleanup: {error}")),
+                    _ => {}
                 }
             }
         }
@@ -1057,6 +1135,9 @@ impl Twill {
                             d.replace(0..len, &r.text);
                             d.set_format(r.bom, &r.newline);
                             let persisted = self.recovery.write_document(&d);
+                            if persisted.is_ok() {
+                                self.recovery_revision.insert(id, d.revision);
+                            }
                             self.add_document(d);
                             if persisted.is_ok() {
                                 let _ = fs::remove_file(file);
@@ -1259,46 +1340,67 @@ fn selection(v: &View) -> std::ops::Range<usize> {
     let a = v.anchor.unwrap_or(v.cursor);
     a.min(v.cursor)..a.max(v.cursor)
 }
-fn find_match(
-    hay: &str,
-    needle: &str,
+fn replace_selected_match(
+    view: &mut View,
+    document: &mut Document,
+    query: &str,
+    replacement: &str,
     match_case: bool,
-    start: usize,
-    backwards: bool,
-) -> Option<(usize, usize)> {
-    if needle.is_empty() {
-        return None;
+) -> bool {
+    if query.is_empty() || view.anchor.is_none() {
+        return false;
     }
-    let target = if match_case {
-        needle.to_owned()
-    } else {
-        needle.to_lowercase()
+    let range = selection(view);
+    let selected = document.slice(range.clone());
+    if selected != query && (match_case || selected.to_lowercase() != query.to_lowercase()) {
+        return false;
+    }
+    document.end_undo_group();
+    document.replace(range.clone(), replacement);
+    view.cursor = range.start + replacement.chars().count();
+    view.anchor = None;
+    view.observed_revision = document.revision;
+    view.typing_until = None;
+    view.reveal = true;
+    true
+}
+fn replace_next_match(
+    view: &mut View,
+    document: &mut Document,
+    query: &str,
+    replacement: &str,
+    match_case: bool,
+) -> bool {
+    if query.is_empty() {
+        return false;
+    }
+    sync_view(view, document);
+    if replace_selected_match(view, document, query, replacement, match_case) {
+        return true;
+    }
+    let text = document.text();
+    let start = document.rope.char_to_byte(view.cursor.min(document.len()));
+    let Some((begin, end)) = find_match(&text, query, match_case, start, false) else {
+        return false;
     };
-    let source = if match_case {
-        hay.to_owned()
-    } else {
-        hay.to_lowercase()
-    };
-    let mut first = None;
-    let mut last = None;
-    let mut previous = None;
-    for (pos, _) in source.match_indices(&target) {
-        let found = (pos, pos + target.len());
-        first.get_or_insert(found);
-        last = Some(found);
-        if backwards {
-            if pos < start {
-                previous = Some(found);
-            }
-        } else if pos >= start {
-            return Some(found);
+    view.anchor = Some(document.rope.byte_to_char(begin));
+    view.cursor = document.rope.byte_to_char(end);
+    replace_selected_match(view, document, query, replacement, match_case)
+}
+fn sync_view(view: &mut View, document: &Document) {
+    if let Some(changes) = document.changes_since(view.observed_revision) {
+        for (start, removed, inserted) in changes {
+            view.cursor = transform_position(view.cursor, start, removed, inserted);
+            view.anchor = view
+                .anchor
+                .map(|position| transform_position(position, start, removed, inserted));
         }
-    }
-    if backwards {
-        previous.or(last)
     } else {
-        first
+        view.anchor = None;
     }
+    view.cursor = view.cursor.min(document.len());
+    view.anchor = view.anchor.map(|position| position.min(document.len()));
+    view.observed_revision = document.revision;
 }
 fn transform_position(p: usize, start: usize, removed: usize, inserted: usize) -> usize {
     if p <= start {
@@ -1371,16 +1473,7 @@ fn editor(
     modal: bool,
     actions: &mut Vec<Action>,
 ) {
-    if let Some(changes) = d.changes_since(v.observed_revision) {
-        for (start, removed, inserted) in changes {
-            v.cursor = transform_position(v.cursor, start, removed, inserted);
-            v.anchor = v
-                .anchor
-                .map(|p| transform_position(p, start, removed, inserted));
-        }
-    }
-    v.cursor = v.cursor.min(d.len());
-    v.anchor = v.anchor.map(|a| a.min(d.len()));
+    sync_view(v, d);
     let font = FontId::monospace(settings.font_size);
     let row_height = settings.font_size * 1.45;
     let extension = v.language.as_deref().unwrap_or_else(|| {
@@ -1407,6 +1500,19 @@ fn editor(
         response.request_focus();
     }
     let focused = response.has_focus() && !modal;
+    if focused {
+        ui.memory_mut(|memory| {
+            memory.set_focus_lock_filter(
+                id,
+                egui::EventFilter {
+                    tab: true,
+                    horizontal_arrows: true,
+                    vertical_arrows: true,
+                    escape: true,
+                },
+            )
+        });
+    }
     let events = if focused {
         ui.input(|i| i.events.clone())
     } else {
@@ -1843,6 +1949,223 @@ fn editor(
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn key_event(key: Key, modifiers: egui::Modifiers) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        }
+    }
+    #[test]
+    fn find_bar_focuses_query_and_enter_searches_escape_closes() {
+        fn frame(
+            ctx: &egui::Context,
+            find: &mut String,
+            replacement: &mut String,
+            match_case: &mut bool,
+            focus: &mut bool,
+            events: Vec<egui::Event>,
+        ) -> Option<FindBarAction> {
+            let mut action = None;
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0))),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::TopBottomPanel::top("find").show(ctx, |ui| {
+                        action = find_bar(ui, find, replacement, match_case, focus);
+                    });
+                },
+            );
+            action
+        }
+        let ctx = egui::Context::default();
+        let mut find = String::new();
+        let mut replacement = String::new();
+        let mut match_case = false;
+        let mut focus = true;
+        assert!(frame(
+            &ctx,
+            &mut find,
+            &mut replacement,
+            &mut match_case,
+            &mut focus,
+            vec![]
+        )
+        .is_none());
+        assert!(!focus);
+        assert!(ctx.wants_keyboard_input());
+        assert!(frame(
+            &ctx,
+            &mut find,
+            &mut replacement,
+            &mut match_case,
+            &mut focus,
+            vec![egui::Event::Text("needle".into())]
+        )
+        .is_none());
+        assert_eq!(find, "needle");
+        assert!(matches!(
+            frame(
+                &ctx,
+                &mut find,
+                &mut replacement,
+                &mut match_case,
+                &mut focus,
+                vec![key_event(Key::Enter, egui::Modifiers::NONE)]
+            ),
+            Some(FindBarAction::Search(false))
+        ));
+        assert!(matches!(
+            frame(
+                &ctx,
+                &mut find,
+                &mut replacement,
+                &mut match_case,
+                &mut focus,
+                vec![key_event(Key::Escape, egui::Modifiers::NONE)]
+            ),
+            Some(FindBarAction::Close)
+        ));
+    }
+    #[test]
+    fn replace_finds_current_match_and_keeps_undo_separate_from_typing() {
+        let mut document = Document::new(1);
+        document.begin_undo_group();
+        document.replace(0..0, "one ONE one");
+        let mut view = View::new(1);
+        assert!(replace_next_match(
+            &mut view,
+            &mut document,
+            "one",
+            "two",
+            false
+        ));
+        assert_eq!(document.text(), "two ONE one");
+        assert_eq!(view.cursor, 3);
+        assert!(view.anchor.is_none());
+        assert!(replace_next_match(
+            &mut view,
+            &mut document,
+            "one",
+            "β",
+            false
+        ));
+        assert_eq!(document.text(), "two β one");
+        document.undo();
+        assert_eq!(document.text(), "two ONE one");
+        document.undo();
+        assert_eq!(document.text(), "one ONE one");
+        assert!(replace_next_match(
+            &mut view,
+            &mut document,
+            "one",
+            "",
+            true
+        ));
+        assert_eq!(document.text(), "one ONE ");
+    }
+    #[test]
+    fn replacement_rebases_selection_after_another_pane_edits() {
+        let mut document = Document::new(1);
+        document.replace(0..0, "one two one");
+        let mut view = View::new(1);
+        view.anchor = Some(8);
+        view.cursor = 11;
+        view.observed_revision = document.revision;
+        document.replace(0..8, "");
+        assert!(replace_next_match(
+            &mut view,
+            &mut document,
+            "one",
+            "three",
+            true
+        ));
+        assert_eq!(document.text(), "three");
+        assert_eq!(view.cursor, 5);
+    }
+    #[test]
+    fn typing_undo_is_grouped_and_tab_arrows_escape_remain_in_editor() {
+        let ctx = egui::Context::default();
+        let mut documents = HashMap::from([(1, Document::new(1))]);
+        let mut layout = Layout::Leaf(Pane {
+            id: 1,
+            tabs: vec![View::new(1)],
+            active: 0,
+        });
+        let mut syntax = Highlighter::new();
+        let settings = Settings::default();
+        let mut frame = |events: Vec<egui::Event>, documents: &mut HashMap<u64, Document>| {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0))),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        ui.button("Another focus target").clicked();
+                        draw_layout(
+                            ui,
+                            &mut layout,
+                            documents,
+                            &settings,
+                            &mut syntax,
+                            1,
+                            false,
+                            &mut vec![],
+                        );
+                    });
+                },
+            );
+        };
+        frame(vec![], &mut documents);
+        frame(
+            vec![
+                key_event(Key::A, egui::Modifiers::NONE),
+                egui::Event::Text("a".into()),
+            ],
+            &mut documents,
+        );
+        frame(
+            vec![
+                key_event(Key::B, egui::Modifiers::NONE),
+                egui::Event::Text("b".into()),
+            ],
+            &mut documents,
+        );
+        frame(
+            vec![key_event(Key::Z, egui::Modifiers::CTRL)],
+            &mut documents,
+        );
+        assert_eq!(documents[&1].text(), "");
+        frame(
+            vec![key_event(Key::Y, egui::Modifiers::CTRL)],
+            &mut documents,
+        );
+        assert_eq!(documents[&1].text(), "ab");
+        frame(
+            vec![key_event(Key::ArrowLeft, egui::Modifiers::NONE)],
+            &mut documents,
+        );
+        frame(vec![egui::Event::Text("X".into())], &mut documents);
+        assert_eq!(documents[&1].text(), "aXb");
+        frame(
+            vec![key_event(Key::Tab, egui::Modifiers::NONE)],
+            &mut documents,
+        );
+        assert_eq!(documents[&1].text(), "aX  b");
+        frame(
+            vec![key_event(Key::Escape, egui::Modifiers::NONE)],
+            &mut documents,
+        );
+        frame(vec![egui::Event::Text("Y".into())], &mut documents);
+        assert_eq!(documents[&1].text(), "aX  Yb");
+    }
     #[test]
     fn find_wraps_without_skipping_adjacent_matches_or_splitting_unicode() {
         assert_eq!(find_match("aaaa", "aa", true, 2, false), Some((2, 4)));

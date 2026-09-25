@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::HashSet,
     fs::{self, File, OpenOptions},
+    io::{BufWriter, Write},
     path::{Path, PathBuf},
     sync::mpsc::{self, Receiver},
     time::{SystemTime, UNIX_EPOCH},
@@ -78,6 +79,23 @@ pub struct Recovery {
 fn default_newline() -> String {
     "\n".into()
 }
+
+// The borrowed form preserves the existing JSON format without flattening the rope.
+#[derive(Serialize)]
+struct RecoveryRef<'a> {
+    id: u64,
+    path: Option<&'a Path>,
+    text: RopeText<'a>,
+    bom: bool,
+    newline: &'a str,
+}
+struct RopeText<'a>(&'a ropey::Rope);
+impl Serialize for RopeText<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        // serde_json streams Display fragments through its JSON string escaper.
+        serializer.collect_str(self.0)
+    }
+}
 pub struct RecoveryStore {
     pub directory: PathBuf,
     _session_lock: Option<File>,
@@ -106,32 +124,48 @@ impl RecoveryStore {
     }
     #[cfg(test)]
     pub fn write(&self, id: u64, path: Option<PathBuf>, text: String) -> Result<()> {
-        self.write_recovery(Recovery {
+        self.write_recovery(
             id,
-            path,
-            text,
-            bom: false,
-            newline: default_newline(),
-        })
+            &Recovery {
+                id,
+                path,
+                text,
+                bom: false,
+                newline: default_newline(),
+            },
+        )
     }
     pub fn write_document(&self, doc: &Document) -> Result<()> {
-        self.write_recovery(Recovery {
-            id: doc.id,
-            path: doc.path.clone(),
-            text: doc.text(),
-            bom: doc.has_bom(),
-            newline: doc.preferred_newline().to_owned(),
-        })
+        self.write_recovery(
+            doc.id,
+            &RecoveryRef {
+                id: doc.id,
+                path: doc.path.as_deref(),
+                text: RopeText(&doc.rope),
+                bom: doc.has_bom(),
+                newline: doc.preferred_newline(),
+            },
+        )
     }
-    fn write_recovery(&self, recovery: Recovery) -> Result<()> {
+    fn write_recovery(&self, id: u64, recovery: &impl Serialize) -> Result<()> {
         fs::create_dir_all(&self.directory)?;
-        let destination = self.directory.join(format!("{}.json", recovery.id));
+        let destination = self.directory.join(format!("{id}.json"));
         let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-        let temporary = self
-            .directory
-            .join(format!(".{}.{}.tmp", recovery.id, nonce));
-        fs::write(&temporary, serde_json::to_vec(&recovery)?)?;
-        if let Err(error) = fs::rename(&temporary, &destination) {
+        let temporary = self.directory.join(format!(".{id}.{nonce}.tmp"));
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        let result = (|| -> Result<()> {
+            let mut writer = BufWriter::new(file);
+            serde_json::to_writer(&mut writer, recovery)?;
+            writer.flush()?;
+            writer.get_ref().sync_all()?;
+            drop(writer);
+            fs::rename(&temporary, &destination)?;
+            Ok(())
+        })();
+        if let Err(error) = result {
             let _ = fs::remove_file(&temporary);
             return Err(error)
                 .with_context(|| format!("replacing recovery snapshot {}", destination.display()));
@@ -140,6 +174,16 @@ impl RecoveryStore {
     }
     pub fn remove(&self, id: u64) {
         let _ = fs::remove_file(self.directory.join(format!("{id}.json")));
+    }
+    pub fn discard_if_saved(&self, doc: &Document) -> Result<bool> {
+        if doc.is_dirty() {
+            return Ok(false);
+        }
+        match fs::remove_file(self.directory.join(format!("{}.json", doc.id))) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+            Err(error) => Err(error.into()),
+        }
     }
     pub fn pending(&self) -> Vec<(PathBuf, Recovery)> {
         self.pending_from(&data_dir().join("recovery"))
@@ -219,6 +263,71 @@ impl FileWatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn streamed_recovery_roundtrips_and_failed_write_keeps_previous_snapshot() {
+        let directory = std::env::temp_dir().join(format!(
+            "twill-stream-recovery-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let store = RecoveryStore {
+            directory: directory.clone(),
+            _session_lock: None,
+        };
+        let text = "\"🧵\\\t\0\r\n".repeat(20_000);
+        let mut doc = Document::new(42);
+        doc.path = Some(directory.join("unicode-🧵.txt"));
+        doc.set_format(true, "\r\n");
+        doc.replace(0..0, &text);
+        assert!(doc.rope.chunks().count() > 1);
+        store.write_document(&doc).unwrap();
+        let path = directory.join("42.json");
+        let bytes = fs::read(&path).unwrap();
+        let restored: Recovery = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(restored.text, text);
+        assert_eq!(restored.path, doc.path);
+        assert!(restored.bom);
+        assert_eq!(restored.newline, "\r\n");
+
+        struct Failing;
+        impl Serialize for Failing {
+            fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+                Err(serde::ser::Error::custom("injected serialization failure"))
+            }
+        }
+        assert!(store.write_recovery(42, &Failing).is_err());
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), 1);
+        fs::remove_file(path).unwrap();
+        fs::remove_dir(directory).unwrap();
+    }
+    #[test]
+    fn undo_to_saved_state_retires_dirty_recovery_snapshot() {
+        let directory = std::env::temp_dir().join(format!(
+            "twill-undo-recovery-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let store = RecoveryStore {
+            directory: directory.clone(),
+            _session_lock: None,
+        };
+        let mut doc = Document::new(1);
+        doc.replace(0..0, "unsaved");
+        store.write_document(&doc).unwrap();
+        assert!(!store.discard_if_saved(&doc).unwrap());
+        assert!(directory.join("1.json").exists());
+        doc.undo();
+        assert!(store.discard_if_saved(&doc).unwrap());
+        assert!(!directory.join("1.json").exists());
+        fs::remove_dir(directory).unwrap();
+    }
     #[test]
     fn settings_roundtrip() {
         let original = Settings::default();

@@ -2,7 +2,7 @@ use anyhow::{bail, Context, Result};
 use ropey::Rope;
 use std::collections::VecDeque;
 use std::fs;
-use std::io::Read;
+use std::io::{BufWriter, Read, Write};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -18,6 +18,11 @@ struct Edit {
     before_state: u64,
     after_state: u64,
     group: Option<u64>,
+}
+impl Edit {
+    fn memory_cost(&self) -> usize {
+        std::mem::size_of::<Self>() + self.before.capacity() + self.after.capacity()
+    }
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -65,7 +70,7 @@ pub struct Document {
     bom: bool,
     newline: String,
     fingerprint: Option<Fingerprint>,
-    history: Vec<Edit>,
+    history: VecDeque<Edit>,
     history_pos: usize,
     history_bytes: usize,
     state: u64,
@@ -85,7 +90,7 @@ impl Document {
             bom: false,
             newline: "\n".into(),
             fingerprint: None,
-            history: Vec::new(),
+            history: VecDeque::new(),
             history_pos: 0,
             history_bytes: 0,
             state: 0,
@@ -216,7 +221,7 @@ impl Document {
             return;
         }
         for edit in self.history.drain(self.history_pos..) {
-            self.history_bytes -= edit.before.len() + edit.after.len();
+            self.history_bytes -= edit.memory_cost();
         }
         let edit = Edit {
             start: range.start,
@@ -229,12 +234,12 @@ impl Document {
         self.next_state += 1;
         self.apply(range, text);
         self.state = edit.after_state;
-        self.history_bytes += edit.before.len() + edit.after.len();
-        self.history.push(edit);
+        self.history_bytes += edit.memory_cost();
+        self.history.push_back(edit);
         self.history_pos = self.history.len();
         while self.history_bytes > MAX_UNDO_BYTES && self.history.len() > 1 {
-            let edit = self.history.remove(0);
-            self.history_bytes -= edit.before.len() + edit.after.len();
+            let edit = self.history.pop_front().unwrap();
+            self.history_bytes -= edit.memory_cost();
             self.history_pos -= 1;
         }
     }
@@ -320,11 +325,6 @@ impl Document {
         if !force && self.path.as_deref() != Some(target.as_path()) && target.exists() {
             bail!("destination already exists: {}", target.display());
         }
-        let mut bytes = Vec::with_capacity(self.rope.len_bytes() + 3);
-        if self.bom {
-            bytes.extend_from_slice(&[0xef, 0xbb, 0xbf]);
-        }
-        bytes.extend_from_slice(self.text().as_bytes());
         let parent = target.parent().context("file has no parent directory")?;
         let stem = target
             .file_name()
@@ -332,15 +332,43 @@ impl Document {
             .to_string_lossy();
         let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
         let temp = parent.join(format!(".{stem}.{}.{}.tmp", std::process::id(), nonce));
-        fs::write(&temp, &bytes).with_context(|| format!("writing {}", temp.display()))?;
-        let result = fs::rename(&temp, &target);
-        if let Err(err) = result {
-            let _ = fs::remove_file(&temp);
-            return Err(err).with_context(|| format!("replacing {}", target.display()));
-        }
+        let result = (|| -> Result<Fingerprint> {
+            let file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temp)?;
+            let mut writer = BufWriter::new(file);
+            let mut fingerprint = Fingerprint::from_bytes(&[]);
+            if self.bom {
+                writer.write_all(&[0xef, 0xbb, 0xbf])?;
+                fingerprint = Fingerprint::from_bytes(&[0xef, 0xbb, 0xbf]);
+            }
+            for chunk in self.rope.chunks() {
+                writer.write_all(chunk.as_bytes())?;
+                fingerprint.len += chunk.len() as u64;
+                fingerprint.hash = hash_chunk(fingerprint.hash, chunk.as_bytes());
+            }
+            writer.flush()?;
+            writer.get_ref().sync_all()?;
+            drop(writer);
+            // Catch changes made while the temporary file was being written.
+            if !force && self.path.as_deref() == Some(target.as_path()) && self.external_changed() {
+                bail!("file changed on disk while saving: {}", target.display());
+            }
+            fs::rename(&temp, &target)?;
+            Ok(fingerprint)
+        })();
+        let fingerprint = match result {
+            Ok(fingerprint) => fingerprint,
+            Err(err) => {
+                let _ = fs::remove_file(&temp);
+                return Err(err).with_context(|| format!("replacing {}", target.display()));
+            }
+        };
         self.path = Some(target);
-        self.fingerprint = Some(Fingerprint::from_bytes(&bytes));
+        self.fingerprint = Some(fingerprint);
         self.saved_state = self.state;
+        self.end_undo_group();
         Ok(())
     }
 
@@ -352,8 +380,10 @@ impl Document {
         self.newline = fresh.newline;
         self.fingerprint = fresh.fingerprint;
         self.history.clear();
+        self.history.shrink_to_fit();
         self.history_pos = 0;
         self.history_bytes = 0;
+        self.end_undo_group();
         self.state = self.next_state;
         self.next_state += 1;
         self.saved_state = self.state;
@@ -385,6 +415,32 @@ fn char_to_byte(text: &str, idx: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn streaming_save_preserves_chunks_and_separates_undo_at_saved_state() {
+        let path = std::env::temp_dir().join(format!(
+            "twill-stream-save-{}-{}.txt",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let text = "a🧵b\r\n".repeat(20_000);
+        let mut doc = Document::new(1);
+        doc.set_format(true, "\r\n");
+        doc.begin_undo_group();
+        doc.replace(0..0, &text);
+        doc.save(Some(&path)).unwrap();
+        let disk = fs::read(&path).unwrap();
+        assert_eq!(&disk[..3], &[0xef, 0xbb, 0xbf]);
+        assert_eq!(&disk[3..], text.as_bytes());
+        assert!(!doc.external_changed());
+        doc.replace(doc.len()..doc.len(), "later");
+        doc.undo();
+        assert_eq!(doc.text(), text);
+        assert!(!doc.is_dirty());
+        fs::remove_file(path).unwrap();
+    }
     #[test]
     fn undo_tracks_saved_state() {
         let mut d = Document::new(1);

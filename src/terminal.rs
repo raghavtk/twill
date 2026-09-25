@@ -9,12 +9,16 @@ use std::{
         Arc, Mutex,
     },
     thread,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
-use egui::{Color32, FontId, Key, Modifiers, Pos2, Rect, Sense, Ui, Vec2};
+use egui::{Color32, EventFilter, FontId, Key, Modifiers, Pos2, Rect, Sense, Ui, Vec2};
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use vt100::{Color, Parser};
+
+const INPUT_CHUNK_SIZE: usize = 4096;
+const MAX_PENDING_INPUT_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[allow(clippy::enum_variant_names)]
@@ -38,6 +42,8 @@ pub struct Terminal {
     master: Box<dyn MasterPty + Send>,
     input: SyncSender<Vec<u8>>,
     pending_input: VecDeque<Vec<u8>>,
+    pending_input_bytes: usize,
+    input_warning_until: Option<Instant>,
     selection: Option<((u16, u16), (u16, u16))>,
     dirty: Arc<AtomicBool>,
     shell: Shell,
@@ -47,6 +53,59 @@ pub struct Terminal {
     rows: u16,
     cols: u16,
     focus_id: Option<egui::Id>,
+}
+
+#[derive(Default)]
+struct CursorQuery {
+    state: u8,
+}
+
+impl CursorQuery {
+    // Keep the partial CSI across PTY reads. Other CSI sequences must not elicit a reply.
+    fn push(&mut self, byte: u8) -> Option<bool> {
+        self.state = match (self.state, byte) {
+            (_, b'\x1b') => 1,
+            (1, b'[') => 2,
+            (2, b'?') => 3,
+            (2, b'6') => 4,
+            (3, b'6') => 5,
+            (4, b'n') => {
+                self.state = 0;
+                return Some(false);
+            }
+            (5, b'n') => {
+                self.state = 0;
+                return Some(true);
+            }
+            _ => 0,
+        };
+        None
+    }
+}
+
+fn process_output(parser: &mut Parser, queries: &mut CursorQuery, bytes: &[u8]) -> Vec<Vec<u8>> {
+    let mut responses = Vec::new();
+    let mut start = 0;
+    for (index, &byte) in bytes.iter().enumerate() {
+        if let Some(private) = queries.push(byte) {
+            parser.process(&bytes[start..=index]);
+            start = index + 1;
+            let (row, col) = parser.screen().cursor_position();
+            let marker = if private { "?" } else { "" };
+            responses.push(format!("\x1b[{marker}{};{}R", row + 1, col + 1).into_bytes());
+        }
+    }
+    parser.process(&bytes[start..]);
+    responses
+}
+
+fn enqueue_input(queue: &mut VecDeque<Vec<u8>>, pending_bytes: &mut usize, bytes: Vec<u8>) -> bool {
+    if bytes.len() > MAX_PENDING_INPUT_BYTES.saturating_sub(*pending_bytes) {
+        return false;
+    }
+    *pending_bytes += bytes.len();
+    queue.extend(bytes.chunks(INPUT_CHUNK_SIZE).map(Vec::from));
+    true
 }
 
 impl Terminal {
@@ -103,17 +162,38 @@ impl Terminal {
         let parser_thread = Arc::clone(&parser);
         let alive_thread = Arc::clone(&alive);
         let dirty_thread = Arc::clone(&dirty);
+        let response_input = input.clone();
         thread::Builder::new()
             .name("twill-pty-reader".into())
             .spawn(move || {
                 let mut buffer = [0u8; 8192];
-                while let Ok(count) = reader.read(&mut buffer) {
+                let mut queries = CursorQuery::default();
+                'read: while let Ok(count) = reader.read(&mut buffer) {
                     if count == 0 {
                         break;
                     }
-                    if let Ok(mut parser) = parser_thread.lock() {
-                        parser.process(&buffer[..count]);
-                        dirty_thread.store(true, Ordering::Release);
+                    let responses = match parser_thread.lock() {
+                        Ok(mut parser) => {
+                            process_output(&mut parser, &mut queries, &buffer[..count])
+                        }
+                        Err(_) => break,
+                    };
+                    dirty_thread.store(true, Ordering::Release);
+                    for response in responses {
+                        let mut response = response;
+                        loop {
+                            if !alive_thread.load(Ordering::Acquire) {
+                                break 'read;
+                            }
+                            match response_input.try_send(response) {
+                                Ok(()) => break,
+                                Err(TrySendError::Full(bytes)) => {
+                                    response = bytes;
+                                    thread::sleep(Duration::from_millis(5));
+                                }
+                                Err(TrySendError::Disconnected(_)) => break 'read,
+                            }
+                        }
                     }
                 }
                 alive_thread.store(false, Ordering::Release);
@@ -125,6 +205,8 @@ impl Terminal {
             master: pair.master,
             input,
             pending_input: VecDeque::new(),
+            pending_input_bytes: 0,
+            input_warning_until: None,
             selection: None,
             dirty,
             shell,
@@ -145,6 +227,19 @@ impl Terminal {
         if response.clicked() {
             response.request_focus();
         }
+        if response.has_focus() {
+            ui.memory_mut(|memory| {
+                memory.set_focus_lock_filter(
+                    response.id,
+                    EventFilter {
+                        tab: true,
+                        horizontal_arrows: true,
+                        vertical_arrows: true,
+                        escape: true,
+                    },
+                );
+            });
+        }
         let painter = ui.painter_at(full_rect);
         painter.rect_filled(full_rect, 0.0, Color32::from_rgb(17, 20, 27));
         let title = format!(
@@ -162,6 +257,18 @@ impl Terminal {
             FontId::monospace(11.0),
             Color32::GRAY,
         );
+        if self
+            .input_warning_until
+            .is_some_and(|until| Instant::now() < until)
+        {
+            painter.text(
+                Pos2::new(full_rect.right() - 6.0, full_rect.top() + 2.0),
+                egui::Align2::RIGHT_TOP,
+                "Input buffer full; retry",
+                FontId::monospace(11.0),
+                Color32::YELLOW,
+            );
+        }
         let rect = Rect::from_min_max(full_rect.min + Vec2::new(0.0, 18.0), full_rect.max);
         let font = FontId::monospace(14.0);
         let cell_width = painter
@@ -362,21 +469,33 @@ impl Terminal {
                 _ => None,
             };
             if let Some(bytes) = bytes {
-                self.pending_input.push_back(bytes);
+                self.queue_input(bytes);
             }
+        }
+    }
+
+    fn queue_input(&mut self, bytes: Vec<u8>) {
+        if !enqueue_input(
+            &mut self.pending_input,
+            &mut self.pending_input_bytes,
+            bytes,
+        ) {
+            self.input_warning_until = Some(Instant::now() + Duration::from_secs(5));
         }
     }
 
     fn flush_input(&mut self) {
         while let Some(bytes) = self.pending_input.pop_front() {
+            let count = bytes.len();
             match self.input.try_send(bytes) {
-                Ok(()) => {}
+                Ok(()) => self.pending_input_bytes -= count,
                 Err(TrySendError::Full(bytes)) => {
                     self.pending_input.push_front(bytes);
                     break;
                 }
                 Err(TrySendError::Disconnected(_)) => {
                     self.pending_input.clear();
+                    self.pending_input_bytes = 0;
                     break;
                 }
             }
@@ -427,9 +546,8 @@ impl Terminal {
     }
 
     pub fn shutdown(&mut self) {
-        if self.alive.swap(false, Ordering::AcqRel) {
-            let _ = self.child.kill();
-        }
+        self.alive.store(false, Ordering::Release);
+        let _ = self.child.kill();
     }
 }
 
@@ -609,47 +727,64 @@ mod tests {
         );
     }
 
+    #[test]
+    fn cursor_queries_reply_at_the_position_where_they_arrive() {
+        let mut parser = Parser::new(24, 80, 0);
+        let mut queries = CursorQuery::default();
+        assert!(process_output(&mut parser, &mut queries, b"ab\x1b[6").is_empty());
+        assert_eq!(
+            process_output(&mut parser, &mut queries, b"nX\x1b[?6n\x1b[6n"),
+            vec![
+                b"\x1b[1;3R".to_vec(),
+                b"\x1b[?1;4R".to_vec(),
+                b"\x1b[1;4R".to_vec()
+            ]
+        );
+    }
+
+    #[test]
+    fn other_output_does_not_trigger_cursor_replies() {
+        let mut parser = Parser::new(24, 80, 0);
+        let mut queries = CursorQuery::default();
+        assert!(process_output(
+            &mut parser,
+            &mut queries,
+            b"plain [6n \x1b[5n \x1b[61n \x1b[?5n \x1b[6m"
+        )
+        .is_empty());
+        assert!(process_output(&mut parser, &mut queries, b"n").is_empty());
+    }
+
+    #[test]
+    fn input_backlog_is_bounded_by_bytes_without_partial_pastes() {
+        let mut queue = VecDeque::new();
+        let mut pending_bytes = 0;
+        assert!(enqueue_input(
+            &mut queue,
+            &mut pending_bytes,
+            vec![b'a'; MAX_PENDING_INPUT_BYTES]
+        ));
+        assert_eq!(pending_bytes, MAX_PENDING_INPUT_BYTES);
+        assert!(queue.iter().all(|chunk| chunk.len() <= INPUT_CHUNK_SIZE));
+        assert!(!enqueue_input(
+            &mut queue,
+            &mut pending_bytes,
+            b"another key".to_vec()
+        ));
+        assert_eq!(pending_bytes, MAX_PENDING_INPUT_BYTES);
+        assert_eq!(queue.iter().map(Vec::len).sum::<usize>(), pending_bytes);
+    }
+
     #[cfg(windows)]
     #[test]
-    #[ignore = "ConPTY smoke test requires a Windows console host that answers device-status queries"]
     fn windows_pty_echo_resize_and_cleanup() {
-        let pair = native_pty_system()
-            .openpty(PtySize {
-                rows: 20,
-                cols: 60,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .expect("open PTY");
-        let mut command = CommandBuilder::new("cmd.exe");
-        command.arg("/Q");
-        let mut child = pair.slave.spawn_command(command).expect("spawn cmd");
-        drop(pair.slave);
-        let mut reader = pair.master.try_clone_reader().expect("reader");
-        let mut writer = pair.master.take_writer().expect("writer");
-        let (tx, rx) = std::sync::mpsc::channel();
-        let reader_thread = std::thread::spawn(move || {
-            let mut bytes = [0u8; 4096];
-            let mut output = Vec::new();
-            while let Ok(count) = reader.read(&mut bytes) {
-                if count == 0 {
-                    break;
-                }
-                eprintln!("PTY read: {:?}", String::from_utf8_lossy(&bytes[..count]));
-                output.extend_from_slice(&bytes[..count]);
-                if String::from_utf8_lossy(&output).contains("TWILL_PTY_SENTINEL") {
-                    break;
-                }
-            }
-            let _ = tx.send(output);
-        });
-        writer
-            .write_all(b"echo TWILL_PTY_SENTINEL\r")
-            .expect("send shell command");
-        writer.flush().expect("flush shell input");
-        let received = rx.recv_timeout(std::time::Duration::from_secs(10));
-        eprintln!("child status before cleanup: {:?}", child.try_wait());
-        pair.master
+        let mut terminal = Terminal::spawn(Shell::CommandPrompt, None).expect("spawn terminal");
+        assert!(
+            terminal.is_running(),
+            "command prompt exited during startup"
+        );
+        terminal
+            .master
             .resize(PtySize {
                 rows: 25,
                 cols: 90,
@@ -657,13 +792,34 @@ mod tests {
                 pixel_height: 0,
             })
             .expect("resize PTY");
-        let _ = child.kill();
-        let _ = child.wait();
-        drop(pair.master);
-        if received.is_ok() {
-            reader_thread.join().expect("reader thread");
+        terminal.parser.lock().unwrap().set_size(25, 90);
+        terminal
+            .input
+            .send(b"@echo TWILL_PTY_SENTINEL\r".to_vec())
+            .expect("send shell command");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let output = loop {
+            let output = terminal.parser.lock().unwrap().screen().contents();
+            // The typed command also contains the sentinel; require the shell's own output line.
+            if output
+                .lines()
+                .any(|line| line.trim() == "TWILL_PTY_SENTINEL")
+            {
+                break output;
+            }
+            assert!(
+                std::time::Instant::now() < deadline && terminal.is_running(),
+                "shell did not produce sentinel; screen: {output:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        assert!(output.contains("TWILL_PTY_SENTINEL"));
+        assert_eq!(terminal.parser.lock().unwrap().screen().size(), (25, 90));
+        terminal.shutdown();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while terminal.child.try_wait().unwrap().is_none() {
+            assert!(std::time::Instant::now() < deadline, "shell did not exit");
+            std::thread::sleep(std::time::Duration::from_millis(20));
         }
-        let output = received.expect("PTY output timeout");
-        assert!(String::from_utf8_lossy(&output).contains("TWILL_PTY_SENTINEL"));
     }
 }

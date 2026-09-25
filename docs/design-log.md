@@ -1,65 +1,59 @@
 # Design log
 
-This log explains implementation choices and records why they were made. It also distinguishes source-level behavior from work that still needs runtime or performance verification.
+This log records decisions visible in the current implementation and calls out the evidence limits that remain. Source behavior is not automatically proof of every interactive Windows workflow.
 
-## Toolchain and first build
+## Toolchain and build
 
-**Starting problem:** Rust was initially missing from `PATH` and the usual Cargo directory. The repository had no Rust source, so there was no build target to test.
+`build.ps1` runs Cargo from the repository. If `.tools/cargo/bin/cargo.exe` exists, it sets `CARGO_HOME`, `RUSTUP_HOME`, and `PATH` to use that local toolchain; otherwise it expects Rust on `PATH`. `.tools` is ignored and is not distributed in a clone. The script supports debug build, release build, and tests. From WSL, invoke it using `powershell.exe -NoProfile -File "$(wslpath -w ./build.ps1)" -Release`, then run `./target/release/twill.exe`. The desktop target is Windows; the current eframe setup does not provide native Linux X11 or Wayland support.
 
-**Resolution:** The project now has a local Rust toolchain under `.tools`, and `build.ps1` configures `CARGO_HOME`, `RUSTUP_HOME`, and `PATH` before invoking Cargo. The first build and test run passed 7 tests on the Windows development environment. The script supports debug build, release build, and tests.
-
-**Remaining evidence gap:** A successful compile and unit-test run do not establish interactive UI behavior or memory usage. Those need runtime checks as features evolve.
+The current offline test run passed 37 tests with 0 failures and 0 ignored tests. Formatting, Clippy with `--all-targets -- -D warnings`, and `cargo build --release --offline` passed.
 
 ## Native UI: eframe and egui
 
-**Decision:** Use `eframe`/`egui` 0.31 for the desktop application and custom editor rendering.
+`src/main.rs` starts `app::Twill` in a native window. `src/app.rs` draws line-numbered editor views with `egui::ScrollArea::show_rows`, so each frame renders the visible line range rather than placing the full document in one text widget. The app manages tabs, nested split panes, prompts, settings, terminal display, and file tree. This describes the implementation, not a measured frame-time or memory profile.
 
-**Reason:** Twill can own its editor surface, document interactions, and terminal presentation within one Rust application. The editor draws visible lines from the document rope through an `egui::ScrollArea::show_rows` view, instead of converting the entire document into a UI text widget each frame.
-
-**Current evidence:** `src/main.rs` creates a resizable native window and starts `app::Twill`. `src/app.rs` implements menus, tabs, split layouts, status, dialogs, and the editor surface. Memory use has not been measured.
+The editor keeps focus while handling navigation and editing keys, including arrows, Tab, and Escape. This matters because those events must reach the editor's own cursor and selection logic instead of being consumed by surrounding UI navigation.
 
 ## Document model: Ropey
 
-**Decision:** Store text in `ropey::Rope` in `src/document.rs`.
+`src/document.rs` stores text in `ropey::Rope`. Rope ranges let edits avoid rebuilding a contiguous document string for each keystroke. The editor uses character offsets; file and search operations preserve original UTF-8 byte positions as needed. Undo history uses a `VecDeque` and is limited to 16 MiB, accounting for each `Edit` record plus the capacities of its before and after strings.
 
-**Reason:** Editing can update rope ranges without rebuilding a single contiguous string for each keystroke. The document uses character offsets at the editor boundary and converts to bytes only where needed for file/search operations. Undo history is capped at 16 MiB of stored before/after edit text.
+Opening reads UTF-8, recognizes a UTF-8 BOM, records newline convention, and fingerprints the original bytes. Save checks for external changes, streams rope chunks to a temporary sibling file, calls `sync_all`, rechecks for external changes, and replaces the destination. Save As and forced overwrite have separate paths. Filesystem replacement behavior still depends on Windows and filesystem semantics, so the relevant Windows flows need runtime coverage.
 
-**Additional file behavior:** Opening reads UTF-8, recognizes and preserves a UTF-8 BOM, records the preferred newline convention, and fingerprints the original bytes. Save checks for external changes and writes through a temporary sibling file before replacing the target. This currently assumes the temporary file can be renamed over the target on the supported Windows filesystem; replacement behavior deserves direct Windows runtime verification.
+The document tests cover saved-state undo/redo, grapheme navigation, BOM and newline preservation, external edit detection, and change-journal behavior. Do not infer broad file compatibility from these focused cases.
 
-**Tests present:** `src/document.rs` covers saved-state undo/redo, grapheme movement, BOM/newline preservation, and external edit detection.
+## Search and Unicode offsets
+
+`src/search.rs` implements literal forward and backward search. Case-sensitive search uses `str::match_indices`. Case-insensitive search streams Unicode lowercase characters through a KMP matcher and keeps only query-sized origin data, mapping matches back to byte ranges in the original text. It avoids lowercasing the whole document, and rejects a match that would cover only part of one character's lowercase expansion. Tests cover expansion, contraction, repeated prefixes, wrapping, and literal matching.
+
+The find bar requests focus for its query when opened from `Ctrl+F` or View > Find / replace. Enter in the query searches forward, Enter in the replacement field replaces, and Escape closes the bar whenever it is open, then returns focus to the editor. The find bar consumes Escape before the editor handles it. Search and replacement rebase stale view positions before creating or changing a match after edits in another pane. Replace uses a matching current selection or advances to the next match, replaces it, and selects the following match. Each replacement remains a separate undo edit. These actions are collected as a small `FindBarAction` enum and handled by the app.
 
 ## Syntax coloring: Syntect and two-face
 
-**Decision:** Run Syntect highlighting with `two-face` syntax definitions in `src/syntax.rs`.
+`src/syntax.rs` processes highlighting on a worker thread and returns visible-line layout jobs through a bounded channel. Rope clones share their backing chunks. The rendered-line cache is bounded by 8 MiB of estimated job text and section storage, with FIFO eviction. The worker yields in quanta of up to 128 lines and clips rendered lines at 4,096 characters so a generated long line cannot monopolize highlighting. Documents above 10 MiB skip highlighting in the editor.
 
-**Reason:** The UI thread should not parse a whole file while drawing. `Highlighter` sends a cloned Rope to a worker thread; Rope clones share underlying storage. The worker processes visible-line results into a bounded channel, and the UI drains results into an LRU-like bounded cache (up to 12,000 line entries). New document revisions replace queued work for that document as the worker notices them.
-
-**Current evidence and limits:** The editor requests highlighting by document revision and file extension. It falls back to plain text if no syntax is found. The app disables highlighting for documents above 10 MiB. Highlighting latency and memory use are not benchmarked. Cache eviction order is FIFO, not a true recency-based LRU.
+`build.rs` loads `assets/JSONC.sublime-syntax` and compiles it into the generated syntax pack used by the app. JSONC is therefore included in the bundled grammar, rather than depending on a machine-installed grammar. No syntax throughput or memory benchmark is recorded here.
 
 ## Terminal: portable-pty and vt100
 
-**Decision:** Use `portable-pty` to launch shells and `vt100` to parse terminal control sequences in `src/terminal.rs`.
+`src/terminal.rs` uses `portable-pty` to launch PowerShell, Command Prompt, or WSL and `vt100` to parse screen control sequences. A reader thread processes shell output while the UI presents the parsed screen and sends input. The code recognizes split cursor-position query sequences across output chunks and writes the cursor response back to the shell. The terminal also supports resize, common keys, and bracketed paste.
 
-**Reason:** Terminal output contains cursor and screen-control sequences, so interpreting it as plain text would not produce a usable terminal. A reader thread feeds output to the parser, while the UI draws the parsed screen and writes keyboard input to the PTY.
-
-**Current scope:** PowerShell, Command Prompt, and WSL launch choices are present. The terminal resizes the PTY with its panel and supports common keys and bracketed paste. Shell-specific behavior and process shutdown need interactive Windows checks.
+Windows startup, shell interaction, resize, query replies, and shutdown are behaviors to validate through the Windows terminal integration test and interactive use. A helper test for parsing bytes alone would not establish that a real spawned shell receives the responses.
 
 ## Editing workflow and Vim subset
 
-Tabs, nested split panes, a file tree, find/replace, and settings are implemented in `src/app.rs`. The Vim mode in `src/vim.rs` has Normal, Insert, Visual, and VisualLine states; motions, counts, delete/change/yank operators, a single register, undo/redo, and repeat-last-change are implemented. It is a deliberately limited subset, not full Vim compatibility.
+Tabs, nested split panes, a file tree, find/replace, and settings are managed in `src/app.rs`. The Vim subset in `src/vim.rs` has Normal, Insert, Visual, and VisualLine states; motions, counts, delete/change/yank operators, a register, undo/redo, and repeat-last-change. It is intentionally not full Vim compatibility.
 
-Per-view cursor, selection anchor, Vim state, and scroll reveal state live in a `View`. `Layout` owns panes and split structure. Documents are stored once in a map and referenced by views, so a document can appear in more than one pane.
+Each `View` owns its cursor, selection anchor, Vim state, and scroll state. `Layout` owns pane structure. Documents live once in a map and views refer to them by ID, so a single document can appear in multiple panes. Filesystem notifications and app actions clear the file tree cache so directory changes can be reflected.
 
 ## Settings, external changes, and recovery
 
-`src/platform.rs` stores settings and recovery data below `%LOCALAPPDATA%\twill` (falling back to the system temporary directory if the environment variable is unavailable). Settings are TOML. Recovery snapshots are JSON and are written after an idle interval when a dirty document's revision changes. Startup offers to restore or discard discovered snapshots.
+`src/platform.rs` stores settings and recovery data below `%LOCALAPPDATA%\twill`, falling back to the system temporary directory if the environment variable is unavailable. Settings use TOML; recovery snapshots use JSON and are written after an idle interval for dirty documents. Startup offers to restore or discard discovered snapshots.
 
-The app polls document fingerprints and also watches parent directories. A clean externally changed document reloads; a dirty one gets a conflict prompt with reload, overwrite, and save-as choices. Recovery and conflict flows are implemented but need forced-crash and external-edit runtime checks before their reliability is established.
+Recovery writes use `RecoveryRef<'a>` to borrow the document path, newline convention, and rope while serialization runs. `RopeText` implements `Serialize` by calling `serializer.collect_str` on Ropey's `Display` implementation, letting `serde_json::to_writer` stream rope chunks through JSON string escaping into a `BufWriter` instead of first building a full text `String` and serialized `Vec<u8>`. The writer flushes and calls `sync_all` before the temporary file is renamed into place. On serialization or write failure, the temporary file is removed, so an earlier snapshot remains intact. Recovery is still synchronous on the UI thread, and its latency has not been measured. Tests cover escaped Unicode, control characters, CRLF, BOM metadata, and an injected serializer failure.
 
-## Known UX issue from source review
-
-The file tree caches directory entries. The cache is cleared when a folder is first opened, but the current watcher path only checks open documents and does not invalidate tree entries after files are added or removed. A tree can therefore stay stale until the cache is cleared. Root has been told; this log should be updated when the refresh behavior changes.
+The app polls document fingerprints and watches parent directories. A clean externally changed document reloads; a dirty one prompts for reload, overwrite, or Save As. Undoing back to a saved revision retires its earlier dirty recovery snapshot. Forced-crash recovery, external-change choices, and competing-write handling still warrant direct interactive Windows checks.
 
 ## Update policy
 
-When behavior or architecture changes, update the relevant decision with the concrete problem, its effect, the chosen change, and the evidence that resolved it. Do not promote intended behavior to verified behavior without a build or runtime check appropriate to the claim.
+When behavior or architecture changes, record the concrete problem, the implementation change, and the evidence that supports the claim. Keep source-level behavior separate from test or runtime evidence, and do not publish stale test counts or unmeasured performance claims.

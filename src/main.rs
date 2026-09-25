@@ -3,6 +3,7 @@
 mod app;
 mod document;
 mod platform;
+mod search;
 mod syntax;
 mod terminal;
 mod vim;

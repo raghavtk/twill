@@ -1,29 +1,36 @@
 # Twill
 
-Twill is a native Windows text editor written in Rust with `eframe` and `egui`. It has a document model, a custom editor view, syntax coloring, a Vim-style command subset, and an embedded pseudoterminal. The current implementation is an early build; see the status below for what has and has not been verified.
+Twill is a native Windows text editor written in Rust with `eframe` and `egui`. It combines a rope-backed editor, syntax coloring, a limited Vim mode, a file tree, split panes, recovery snapshots, and an embedded Windows pseudoterminal. WSL is available as a terminal shell; Twill is not a native Ubuntu/Linux desktop application.
 
 ## Build
 
-The project includes a local Rust toolchain under `.tools`. From PowerShell, run:
+From PowerShell in the repository, run:
 
 ```powershell
 .\build.ps1
+.\build.ps1 -Test
+.\build.ps1 -Release
 ```
 
-Use `.uild.ps1 -Test` to run the Rust unit tests, or `.uild.ps1 -Release` to create a release build. The script sets `CARGO_HOME`, `RUSTUP_HOME`, and `PATH` for the bundled toolchain. The first build passed 7 tests on the Windows development environment. The application has compiled; interactive runtime behavior and memory use have not yet been characterized.
+The script uses `.tools` when that local Rust toolchain is present, otherwise it uses the Rust installation on `PATH`. `.tools` is ignored by Git and is not included in a fresh clone, so install Rust locally or bootstrap that toolchain before building. To build the Windows app from WSL, call the PowerShell script through Windows interop:
 
-## Current implementation
+```bash
+powershell.exe -NoProfile -File "$(wslpath -w ./build.ps1)" -Release
+./target/release/twill.exe
+```
 
-- Documents use Ropey and track edits, bounded undo history, UTF-8 BOMs, newline conventions, and changes made outside the editor.
-- The editor renders line-numbered views and supports cursor movement, text entry, selection, clipboard operations, find/replace, tabs, split panes, and a file tree.
-- Syntax coloring runs on a worker thread using Syntect and `two-face` grammars. Large files over 10 MiB skip syntax work in the editor view.
-- The Vim mode includes a subset of modes, motions, operators, registers, and repeat-last-change behavior. This is not full Vim compatibility.
-- The terminal uses `portable-pty` and `vt100`, with PowerShell, Command Prompt, and WSL launch choices. Shell processes and terminal parsing run outside the UI thread.
-- Settings and recovery data are stored under `%LOCALAPPDATA%\twill` when `LOCALAPPDATA` is available.
+Do not use `cargo run` from native WSL for the desktop app: the current `eframe` build does not include Linux X11 or Wayland support.
 
-These are source-level capabilities. Recovery, terminal behavior, and common editing workflows still need broader runtime verification. The editor is local and does not connect to remote services.
+## Use
 
-## Documentation
+The main shortcuts include `Ctrl+N` for a new document, `Ctrl+O` to open, `Ctrl+S` to save, `Ctrl+Shift+S` for Save As, `Ctrl+F` to open and focus Find / replace, `Ctrl+G` to open the command prompt, `Ctrl+W` to close the current tab, `Ctrl+Tab` to switch tabs, and ``Ctrl+` `` to show or hide the terminal. In Find / replace, Enter in the query finds the next match, Enter in the replacement field replaces, and Escape closes the bar. Replace uses a matching selection or finds the next match, replaces it, then selects the following match. Each replacement is a separate undo edit. The command prompt accepts `:w`, `:q`, `:q!`, and `:wq`, plus a line number to navigate. Use the View menu to create a split. The Vim mode implements a subset of modes, motions, operators, registers, and repeat behavior, not full Vim compatibility.
 
-- [Design log](docs/design-log.md): implementation decisions, tradeoffs, known gaps, and setup history.
-- [Rust tour](docs/rust-tour.md): Rust concepts explained through the current source code.
+The terminal menu offers PowerShell, Command Prompt, and WSL. WSL requires a working WSL installation. Settings and recovery data are stored under `%LOCALAPPDATA%\twill` when that environment variable exists.
+
+## Implementation notes
+
+Documents use Ropey, bounded undo history, UTF-8 BOM and newline preservation, external-change checks, and crash recovery snapshots. Syntax work runs on a worker thread; its rendered-line cache is capped at 8 MiB, and the bundled grammar pack includes JSONC. Highlighting is skipped for documents over 10 MiB. These are implementation limits, not benchmark results.
+
+See the [design log](docs/design-log.md) for decisions and known limits, and the [Rust tour](docs/rust-tour.md) for examples tied to the current source.
+
+The current offline test suite passed 37 tests with 0 failures and 0 ignored tests. Formatting, Clippy with `--all-targets -- -D warnings`, and the offline release build passed.
