@@ -1,0 +1,4 @@
+/target/
+/.tools/
+*.pdb
+/dist/
