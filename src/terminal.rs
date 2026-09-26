@@ -318,6 +318,7 @@ impl Terminal {
             self.handle_input(ui);
         }
         self.flush_input();
+        let caret_visible = crate::caret::visible(ui.ctx(), response.id, response.has_focus());
         if response.drag_started() {
             if let Some(position) = response.interact_pointer_pos() {
                 if rect.contains(position) {
@@ -380,7 +381,7 @@ impl Terminal {
                     }
                 }
             }
-            if response.has_focus() && !screen.hide_cursor() {
+            if caret_visible && !screen.hide_cursor() && screen.scrollback() == 0 {
                 let (row, col) = screen.cursor_position();
                 let cursor = Rect::from_min_size(
                     Pos2::new(

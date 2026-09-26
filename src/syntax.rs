@@ -10,6 +10,7 @@ use std::{
     ops::Range,
     sync::mpsc::{self, Receiver, Sender, SyncSender, TryRecvError, TrySendError},
     thread,
+    time::Duration,
 };
 use syntect::{
     easy::HighlightLines,
@@ -63,11 +64,17 @@ impl Default for Highlighter {
 }
 impl Highlighter {
     pub fn new() -> Self {
+        Self::start(None)
+    }
+    pub fn with_context(context: egui::Context) -> Self {
+        Self::start(Some(context))
+    }
+    fn start(context: Option<egui::Context>) -> Self {
         let (sender, receiver) = mpsc::channel();
         let (results_sender, results) = mpsc::sync_channel(512);
         let _ = thread::Builder::new()
             .name("twill-syntax".into())
-            .spawn(move || worker(receiver, results_sender));
+            .spawn(move || worker(receiver, results_sender, context));
         Self {
             sender,
             results,
@@ -225,16 +232,19 @@ impl<'a> WorkerDocument<'a> {
     }
 }
 
-fn worker(receiver: Receiver<Message>, results: SyncSender<LineResult>) {
+fn worker(
+    receiver: Receiver<Message>,
+    results: SyncSender<LineResult>,
+    context: Option<egui::Context>,
+) {
     let syntaxes = syntax_set();
     let themes = ThemeSet::load_defaults();
     let mut docs: HashMap<u64, WorkerDocument<'_>> = HashMap::new();
     let mut round_robin = VecDeque::new();
     loop {
-        let first = if docs
-            .values()
-            .any(|doc| doc.next < doc.visible.end || doc.pending.is_some())
-        {
+        let first = if docs.values().any(|doc| {
+            doc.next < doc.visible.end.min(doc.rope.len_lines()) || doc.pending.is_some()
+        }) {
             match receiver.try_recv() {
                 Ok(message) => Some(message),
                 Err(TryRecvError::Empty) => None,
@@ -254,7 +264,16 @@ fn worker(receiver: Receiver<Message>, results: SyncSender<LineResult>) {
         }
         if let Some(id) = round_robin.pop_front() {
             if let Some(doc) = docs.get_mut(&id) {
-                process_quantum(doc, &syntaxes, &results);
+                let delivered = process_quantum(doc, &syntaxes, &results);
+                if delivered > 0 {
+                    if let Some(context) = &context {
+                        // Coalesce completed lines into a frame instead of waiting for idle polling.
+                        context.request_repaint_after(Duration::from_millis(16));
+                    }
+                } else if doc.pending.is_some() {
+                    // A full results queue must not turn this worker into a busy loop.
+                    thread::sleep(Duration::from_millis(2));
+                }
                 round_robin.push_back(id);
             }
         }
@@ -319,15 +338,16 @@ fn process_quantum(
     doc: &mut WorkerDocument<'_>,
     syntaxes: &SyntaxSet,
     results: &SyncSender<LineResult>,
-) {
+) -> usize {
+    let mut delivered = 0;
     if let Some(result) = doc.pending.take() {
         match results.try_send(result) {
-            Ok(()) => {}
+            Ok(()) => delivered += 1,
             Err(TrySendError::Full(result)) => {
                 doc.pending = Some(result);
-                return;
+                return delivered;
             }
-            Err(TrySendError::Disconnected(_)) => return,
+            Err(TrySendError::Disconnected(_)) => return delivered,
         }
     }
     let end = doc.visible.end.min(doc.rope.len_lines());
@@ -349,14 +369,18 @@ fn process_quantum(
                 let job = plain(&source, doc.key.dark);
                 let bytes = job.text.len()
                     + job.sections.len() * std::mem::size_of::<egui::text::LayoutSection>();
-                if let Err(TrySendError::Full(result)) = results.try_send(LineResult {
+                match results.try_send(LineResult {
                     key: doc.key,
                     index,
                     job,
                     bytes,
                 }) {
-                    doc.pending = Some(result);
-                    return;
+                    Ok(()) => delivered += 1,
+                    Err(TrySendError::Full(result)) => {
+                        doc.pending = Some(result);
+                        return delivered;
+                    }
+                    Err(TrySendError::Disconnected(_)) => return delivered,
                 }
             }
             continue;
@@ -378,14 +402,15 @@ fn process_quantum(
             bytes,
         };
         match results.try_send(result) {
-            Ok(()) => {}
+            Ok(()) => delivered += 1,
             Err(TrySendError::Full(result)) => {
                 doc.pending = Some(result);
-                return;
+                return delivered;
             }
-            Err(TrySendError::Disconnected(_)) => return,
+            Err(TrySendError::Disconnected(_)) => return delivered,
         }
     }
+    delivered
 }
 
 fn syntax_for<'a>(set: &'a SyntaxSet, extension: &str) -> &'a SyntaxReference {
@@ -465,6 +490,52 @@ fn plain(text: &str, dark: bool) -> LayoutJob {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn completed_highlighting_requests_a_frame_without_idle_polling() {
+        let context = egui::Context::default();
+        let (sender, receiver) = mpsc::channel();
+        context.set_request_repaint_callback(move |info| {
+            let _ = sender.send(info.delay);
+        });
+        let mut highlighter = Highlighter::with_context(context);
+        highlighter.request(1, 1, "rs", Rope::from_str("fn main() {}"), true);
+        highlighter.request_visible(1, 1, 1, 0, 1);
+        let delay = receiver.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert!(delay <= Duration::from_millis(16));
+        highlighter.drain();
+        assert_eq!(highlighter.cache.len(), 1);
+    }
+    #[test]
+    fn full_result_queue_preserves_pending_line_until_space_is_available() {
+        let syntaxes = syntax_set();
+        let themes = ThemeSet::load_defaults();
+        let theme = &themes.themes["base16-ocean.dark"];
+        let syntax = syntax_for(&syntaxes, "rs");
+        let mut doc = WorkerDocument {
+            key: DocumentKey {
+                id: 1,
+                revision: 1,
+                dark: true,
+                language: 0,
+            },
+            rope: Rope::from_str("let a = 1;\nlet b = 2;"),
+            syntax,
+            theme,
+            lines: HighlightLines::new(syntax, theme),
+            next: 0,
+            visible: 0..100,
+            pending: None,
+        };
+        let (sender, receiver) = mpsc::sync_channel(1);
+        assert_eq!(process_quantum(&mut doc, &syntaxes, &sender), 1);
+        assert!(doc.pending.is_some());
+        assert_eq!(process_quantum(&mut doc, &syntaxes, &sender), 0);
+        assert_eq!(receiver.try_recv().unwrap().index, 0);
+        assert_eq!(process_quantum(&mut doc, &syntaxes, &sender), 1);
+        assert_eq!(receiver.try_recv().unwrap().index, 1);
+        assert!(doc.pending.is_none());
+        assert_eq!(process_quantum(&mut doc, &syntaxes, &sender), 0);
+    }
     #[test]
     fn requested_syntaxes_are_available() {
         let set = syntax_set();

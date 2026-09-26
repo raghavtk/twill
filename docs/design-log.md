@@ -6,13 +6,11 @@ This log records decisions visible in the current implementation and calls out t
 
 `build.ps1` runs Cargo from the repository. If `.tools/cargo/bin/cargo.exe` exists, it sets `CARGO_HOME`, `RUSTUP_HOME`, and `PATH` to use that local toolchain; otherwise it expects Rust on `PATH`. `.tools` is ignored and is not distributed in a clone. The script supports debug build, release build, and tests. From WSL, invoke it using `powershell.exe -NoProfile -File "$(wslpath -w ./build.ps1)" -Release`, then run `./target/release/twill.exe`. The desktop target is Windows; the current eframe setup does not provide native Linux X11 or Wayland support.
 
-The current offline test run passed 37 tests with 0 failures and 0 ignored tests. Formatting, Clippy with `--all-targets -- -D warnings`, and `cargo build --release --offline` passed.
-
 ## Native UI: eframe and egui
 
 `src/main.rs` starts `app::Twill` in a native window. `src/app.rs` draws line-numbered editor views with `egui::ScrollArea::show_rows`, so each frame renders the visible line range rather than placing the full document in one text widget. The app manages tabs, nested split panes, prompts, settings, terminal display, and file tree. This describes the implementation, not a measured frame-time or memory profile.
 
-The editor keeps focus while handling navigation and editing keys, including arrows, Tab, and Escape. This matters because those events must reach the editor's own cursor and selection logic instead of being consumed by surrounding UI navigation.
+The editor keeps focus while handling navigation and editing keys, including arrows, Tab, and Escape. This matters because those events must reach the editor's own cursor and selection logic instead of being consumed by surrounding UI navigation. Each view stores a preferred character column for vertical arrow and page movement. It keeps that column across short lines and snaps target positions to grapheme boundaries, so movement does not split combining sequences or emoji. Horizontal input, edits, pointer placement, search, and document revisions clear the stored column. This is character-based placement, not alignment by expanded tab width or rendered pixels. With Vim disabled, Left or Right collapses an existing selection to its corresponding start or end without taking an additional step, regardless of selection orientation.
 
 ## Document model: Ropey
 
@@ -42,7 +40,7 @@ Windows startup, shell interaction, resize, query replies, and shutdown are beha
 
 ## Editing workflow and Vim subset
 
-Tabs, nested split panes, a file tree, find/replace, and settings are managed in `src/app.rs`. The Vim subset in `src/vim.rs` has Normal, Insert, Visual, and VisualLine states; motions, counts, delete/change/yank operators, a register, undo/redo, and repeat-last-change. It is intentionally not full Vim compatibility.
+Tabs, nested split panes, a file tree, find/replace, and settings are managed in `src/app.rs`. The Vim subset in `src/vim.rs` has Normal, Insert, Visual, and VisualLine states; motions, counts, delete/change/yank operators, a register, undo/redo, and repeat-last-change. Counted `x` deletion stops at the current line end and removes whole grapheme clusters without crossing LF or CRLF. Append (`a`) stays on the current line at its end and on an empty line. Escape from Insert at a line start keeps the cursor on that same line. It is intentionally not full Vim compatibility.
 
 Each `View` owns its cursor, selection anchor, Vim state, and scroll state. `Layout` owns pane structure. Documents live once in a map and views refer to them by ID, so a single document can appear in multiple panes. Filesystem notifications and app actions clear the file tree cache so directory changes can be reflected.
 
@@ -53,6 +51,14 @@ Each `View` owns its cursor, selection anchor, Vim state, and scroll state. `Lay
 Recovery writes use `RecoveryRef<'a>` to borrow the document path, newline convention, and rope while serialization runs. `RopeText` implements `Serialize` by calling `serializer.collect_str` on Ropey's `Display` implementation, letting `serde_json::to_writer` stream rope chunks through JSON string escaping into a `BufWriter` instead of first building a full text `String` and serialized `Vec<u8>`. The writer flushes and calls `sync_all` before the temporary file is renamed into place. On serialization or write failure, the temporary file is removed, so an earlier snapshot remains intact. Recovery is still synchronous on the UI thread, and its latency has not been measured. Tests cover escaped Unicode, control characters, CRLF, BOM metadata, and an injected serializer failure.
 
 The app polls document fingerprints and watches parent directories. A clean externally changed document reloads; a dirty one prompts for reload, overwrite, or Save As. Undoing back to a saved revision retires its earlier dirty recovery snapshot. Forced-crash recovery, external-change choices, and competing-write handling still warrant direct interactive Windows checks.
+
+## GUI polish and cursor feedback
+
+The tab row is now 25 logical pixels tall with less top padding. Inactive labels use higher contrast against a quieter background. The empty terminal chooser starts at 48 pixels and fills its allocated panel so resizing works before shell selection. A running shell uses a separate panel size, initially 280 pixels, so it does not inherit the chooser's small height. A headless layout regression test verifies the compact chooser and larger session sizes; the complete suite passes 48 tests, and Clippy passes with warnings denied. The running release executable must be closed before rebuilding it.
+
+Tabs now use an integrated close icon without a separate button box, widths between 124 and 208 logical pixels, a restrained active underline, filename truncation, and path tooltips. Folder expanders are drawn chevrons so they do not depend on font glyph availability. Both editor and terminal use `src/caret.rs` to blink every half second, reset on input or focus, and schedule the next transition instead of continuously repainting. Terminal cursors remain hidden when the shell requests it or scrollback is shown.
+
+The syntax worker requests a repaint within 16 ms after delivering results instead of waiting for the 500 ms idle refresh. It backs off when the results queue is full and treats a viewport extending past EOF as complete. Tests cover repaint notification and retention of pending results under backpressure. No new interactive GUI verification or frame-time benchmark was performed for this pass, at the user's request.
 
 ## Update policy
 

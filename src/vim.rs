@@ -65,7 +65,8 @@ impl VimState {
                 "Escape" | "Esc" => {
                     self.mode = VimMode::Normal;
                     doc.end_undo_group();
-                    *cursor = doc.prev_grapheme(*cursor);
+                    let start = doc.line_start(doc.line_of(*cursor));
+                    *cursor = doc.prev_grapheme(*cursor).max(start);
                     self.recording.push("Escape".into());
                     if !self.replaying {
                         self.last_change = self.recording.clone();
@@ -236,7 +237,10 @@ impl VimState {
             "i" | "a" | "I" | "A" | "o" | "O" => {
                 doc.begin_undo_group();
                 match key {
-                    "a" => *cursor = doc.next_grapheme(*cursor),
+                    "a" => {
+                        let end = line_end(doc, doc.line_of(*cursor));
+                        *cursor = doc.next_grapheme(*cursor).min(end);
+                    }
                     "I" => *cursor = first_nonblank(doc, doc.line_of(*cursor)),
                     "A" => *cursor = line_end(doc, doc.line_of(*cursor)),
                     "o" => {
@@ -265,8 +269,12 @@ impl VimState {
             }
             "x" => {
                 let mut end = *cursor;
+                let line_end = line_end(doc, doc.line_of(*cursor));
                 for _ in 0..count {
-                    end = doc.next_grapheme(end);
+                    end = doc.next_grapheme(end).min(line_end);
+                    if end == line_end {
+                        break;
+                    }
                 }
                 if end > *cursor {
                     self.register = doc.slice(*cursor..end);
@@ -577,5 +585,62 @@ mod tests {
         assert_eq!(d.text(), "first");
         keys(&mut v, &mut d, &mut c, &["p"]);
         assert_eq!(d.text(), "first\nlast");
+    }
+
+    #[test]
+    fn counted_x_stops_before_line_break() {
+        for newline in ["\n", "\r\n"] {
+            let mut d = Document::new(1);
+            d.replace(0..0, &format!("e\u{301}🙂{newline}next"));
+            let mut v = VimState::new();
+            let mut c = 0;
+            keys(&mut v, &mut d, &mut c, &["9", "x"]);
+            assert_eq!(d.text(), format!("{newline}next"));
+            assert_eq!(c, 0);
+            keys(&mut v, &mut d, &mut c, &["x"]);
+            assert_eq!(d.text(), format!("{newline}next"));
+        }
+    }
+
+    #[test]
+    fn append_stays_on_current_line_at_end_and_when_empty() {
+        for newline in ["\n", "\r\n"] {
+            let mut d = Document::new(1);
+            d.replace(0..0, &format!("e\u{301}{newline}next"));
+            let mut v = VimState::new();
+            let mut c = 0;
+            keys(&mut v, &mut d, &mut c, &["a", "Z", "Escape"]);
+            assert_eq!(d.text(), format!("e\u{301}Z{newline}next"));
+            assert_eq!(c, 2);
+
+            let mut d = Document::new(2);
+            d.replace(0..0, &format!("{newline}next"));
+            let mut v = VimState::new();
+            let mut c = 0;
+            keys(&mut v, &mut d, &mut c, &["a", "Z", "Escape"]);
+            assert_eq!(d.text(), format!("Z{newline}next"));
+            assert_eq!(c, 0);
+        }
+    }
+
+    #[test]
+    fn escape_from_insert_at_line_start_stays_on_that_line() {
+        for newline in ["\n", "\r\n"] {
+            let mut d = Document::new(1);
+            d.replace(0..0, &format!("first{newline}next"));
+            let mut v = VimState::new();
+            let mut c = d.line_start(1);
+            keys(&mut v, &mut d, &mut c, &["i", "Escape"]);
+            assert_eq!(c, d.line_start(1));
+
+            let mut d = Document::new(2);
+            d.set_format(false, newline);
+            d.replace(0..0, &format!("first{newline}next"));
+            let mut v = VimState::new();
+            let mut c = 0;
+            keys(&mut v, &mut d, &mut c, &["o", "Escape"]);
+            assert_eq!(d.text(), format!("first{newline}{newline}next"));
+            assert_eq!(c, d.line_start(1));
+        }
     }
 }

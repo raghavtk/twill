@@ -22,6 +22,7 @@ struct View {
     reveal: bool,
     observed_revision: u64,
     typing_until: Option<Instant>,
+    preferred_column: Option<usize>,
     language: Option<String>,
 }
 impl View {
@@ -34,6 +35,7 @@ impl View {
             reveal: false,
             observed_revision: 0,
             typing_until: None,
+            preferred_column: None,
             language: None,
         }
     }
@@ -221,7 +223,7 @@ impl Twill {
             active_pane: 1,
             next_id: 2,
             settings,
-            highlighter: Highlighter::new(),
+            highlighter: Highlighter::with_context(cc.egui_ctx.clone()),
             watcher: FileWatcher::new(),
             root: None,
             tree_cache: HashMap::new(),
@@ -417,6 +419,7 @@ impl Twill {
         if let Some((a, b)) = found {
             v.anchor = Some(d.rope.byte_to_char(a));
             v.cursor = d.rope.byte_to_char(b);
+            v.preferred_column = None;
             v.reveal = true;
         } else {
             self.message = Some("No matches".into());
@@ -477,6 +480,7 @@ impl Twill {
                         if let Some(v) = p.tabs.get_mut(p.active) {
                             if let Some(d) = self.documents.get(&v.document) {
                                 v.cursor = d.line_start(line.saturating_sub(1));
+                                v.preferred_column = None;
                                 v.anchor = None;
                                 v.reveal = true;
                             }
@@ -835,37 +839,41 @@ impl eframe::App for Twill {
             });
         }
         if self.terminal_visible {
-            egui::TopBottomPanel::bottom("terminal")
-                .resizable(true)
-                .default_height(210.0)
-                .min_height(80.0)
-                .show(ctx, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label("TERMINAL");
-                        if self.terminal.is_none() {
-                            for (name, shell) in [
-                                ("PowerShell", Shell::PowerShell),
-                                ("Command Prompt", Shell::CommandPrompt),
-                                ("WSL", Shell::Wsl),
-                            ] {
-                                if ui.button(name).clicked() {
-                                    match Terminal::spawn(shell, self.root.as_deref()) {
-                                        Ok(t) => self.terminal = Some(t),
-                                        Err(e) => self.message = Some(format!("Terminal: {e:#}")),
+            let has_session = self.terminal.is_some();
+            terminal_panel(has_session).show(ctx, |ui| {
+                // Empty chooser content must still fill the panel's resize allocation.
+                ui.set_min_height(ui.available_height());
+                ui.horizontal(|ui| {
+                    ui.label("TERMINAL");
+                    if self.terminal.is_none() {
+                        for (name, shell) in [
+                            ("PowerShell", Shell::PowerShell),
+                            ("Command Prompt", Shell::CommandPrompt),
+                            ("WSL", Shell::Wsl),
+                        ] {
+                            if ui.button(name).clicked() {
+                                match Terminal::spawn(shell, self.root.as_deref()) {
+                                    Ok(t) => {
+                                        self.terminal = Some(t);
+                                        ctx.request_repaint();
                                     }
+                                    Err(e) => self.message = Some(format!("Terminal: {e:#}")),
                                 }
                             }
-                        } else if ui.button("End session").clicked() {
-                            self.terminal_close = true;
                         }
-                        if self.terminal.as_mut().is_some_and(|t| !t.is_running()) {
-                            ui.label("Session exited");
-                        }
-                    });
+                    } else if ui.button("End session").clicked() {
+                        self.terminal_close = true;
+                    }
+                    if self.terminal.as_mut().is_some_and(|t| !t.is_running()) {
+                        ui.label("Session exited");
+                    }
+                });
+                if has_session {
                     if let Some(t) = self.terminal.as_mut() {
                         t.ui(ui);
                     }
-                });
+                }
+            });
         }
         if let Some(root) = self.root.clone() {
             egui::SidePanel::left("files")
@@ -1191,13 +1199,26 @@ fn tree(
             ui.add_space(depth as f32 * 10.0);
             if dir {
                 let expanded = open.contains(&child);
-                if ui
-                    .selectable_label(
-                        expanded,
-                        format!("{} {}", if expanded { "▾" } else { "▸" }, name),
-                    )
-                    .clicked()
-                {
+                let label = ui.add(egui::Button::new(format!("    {name}")).frame(false));
+                let center = Pos2::new(label.rect.left() + 7.0, label.rect.center().y);
+                let points = if expanded {
+                    vec![
+                        center + Vec2::new(-3.0, -1.5),
+                        center + Vec2::new(0.0, 1.5),
+                        center + Vec2::new(3.0, -1.5),
+                    ]
+                } else {
+                    vec![
+                        center + Vec2::new(-1.5, -3.0),
+                        center + Vec2::new(1.5, 0.0),
+                        center + Vec2::new(-1.5, 3.0),
+                    ]
+                };
+                ui.painter().add(egui::Shape::line(
+                    points,
+                    Stroke::new(1.2_f32, ui.visuals().text_color()),
+                ));
+                if label.clicked() {
                     if expanded {
                         open.remove(&child);
                     } else if !link {
@@ -1215,6 +1236,68 @@ fn tree(
 }
 
 // Explicit borrows keep the UI from borrowing the whole application during rendering.
+const TAB_MIN_WIDTH: f32 = 124.0;
+const TAB_MAX_WIDTH: f32 = 208.0;
+const TAB_GAP: f32 = 4.0;
+const TAB_HEIGHT: f32 = 25.0;
+
+fn terminal_panel(has_session: bool) -> egui::TopBottomPanel {
+    // Separate sizes keep the compact chooser from shrinking a newly opened shell.
+    egui::TopBottomPanel::bottom(if has_session {
+        "terminal-session"
+    } else {
+        "terminal-chooser"
+    })
+    .resizable(true)
+    .default_height(if has_session { 280.0 } else { 48.0 })
+    .min_height(if has_session { 120.0 } else { 36.0 })
+}
+
+fn tab_width(available: f32, count: usize) -> f32 {
+    if count == 0 {
+        return TAB_MIN_WIDTH;
+    }
+    ((available - TAB_GAP * count.saturating_sub(1) as f32) / count as f32)
+        .clamp(TAB_MIN_WIDTH, TAB_MAX_WIDTH)
+}
+
+fn truncated_tab_title(ui: &egui::Ui, title: &str, font: &FontId, max_width: f32) -> String {
+    let measure = |text: &str| {
+        ui.fonts(|fonts| {
+            fonts
+                .layout_no_wrap(text.to_owned(), font.clone(), Color32::WHITE)
+                .size()
+                .x
+        })
+    };
+    if measure(title) <= max_width {
+        return title.to_owned();
+    }
+    let ellipsis = "…";
+    let boundaries: Vec<usize> = title.char_indices().map(|(i, _)| i).collect();
+    let mut low = 0;
+    let mut high = boundaries.len();
+    while low < high {
+        let mid = (low + high).div_ceil(2);
+        let prefix = if mid == boundaries.len() {
+            title
+        } else {
+            &title[..boundaries[mid]]
+        };
+        if measure(&format!("{prefix}{ellipsis}")) <= max_width {
+            low = mid;
+        } else {
+            high = mid - 1;
+        }
+    }
+    let prefix = if low == boundaries.len() {
+        title
+    } else {
+        &title[..boundaries[low]]
+    };
+    format!("{prefix}{ellipsis}")
+}
+
 #[allow(clippy::too_many_arguments)]
 fn draw_layout(
     ui: &mut egui::Ui,
@@ -1283,10 +1366,17 @@ fn draw_layout(
         }
         Layout::Leaf(p) => {
             ui.push_id(p.id, |ui| {
+                let width = tab_width(ui.available_width(), p.tabs.len());
+                ui.add_space(1.0);
                 egui::ScrollArea::horizontal()
                     .id_salt("tabs")
+                    .drag_to_scroll(false)
+                    .scroll_bar_visibility(
+                        egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded,
+                    )
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = TAB_GAP;
                             for (i, v) in p.tabs.iter().enumerate() {
                                 if let Some(d) = docs.get(&v.document) {
                                     let title = d
@@ -1295,22 +1385,123 @@ fn draw_layout(
                                         .and_then(|p| p.file_name())
                                         .map(|s| s.to_string_lossy().into_owned())
                                         .unwrap_or_else(|| "Untitled".into());
-                                    let label = format!(
-                                        "{}{}",
-                                        title,
-                                        if d.is_dirty() { " *" } else { "" }
+                                    let dirty = d.is_dirty();
+                                    let selected = p.active == i;
+                                    let (rect, tab_response) = ui.allocate_exact_size(
+                                        Vec2::new(width, TAB_HEIGHT),
+                                        Sense::click(),
                                     );
-                                    if ui.selectable_label(p.active == i, label).clicked() {
+                                    let close_rect = Rect::from_center_size(
+                                        Pos2::new(rect.max.x - 16.0, rect.center().y),
+                                        Vec2::splat(22.0),
+                                    );
+                                    let close_response = ui.interact(
+                                        close_rect,
+                                        ui.id().with(("close-tab", v.document)),
+                                        Sense::click(),
+                                    );
+                                    let hovered =
+                                        tab_response.hovered() || close_response.hovered();
+                                    let visuals = ui.visuals();
+                                    let fill = if selected {
+                                        if visuals.dark_mode {
+                                            Color32::from_gray(43)
+                                        } else {
+                                            Color32::from_gray(240)
+                                        }
+                                    } else if hovered {
+                                        visuals.widgets.hovered.bg_fill
+                                    } else {
+                                        if visuals.dark_mode {
+                                            Color32::from_gray(30)
+                                        } else {
+                                            Color32::from_gray(228)
+                                        }
+                                    };
+                                    ui.painter().rect_filled(rect, 5.0, fill);
+                                    if selected {
+                                        let accent = Rect::from_min_max(
+                                            Pos2::new(rect.min.x + 9.0, rect.max.y - 2.0),
+                                            Pos2::new(rect.max.x - 9.0, rect.max.y),
+                                        );
+                                        ui.painter().rect_filled(
+                                            accent,
+                                            1.0,
+                                            visuals.selection.bg_fill,
+                                        );
+                                    }
+                                    let font = FontId::proportional(13.0);
+                                    let title_space = width - if dirty { 53.0 } else { 39.0 };
+                                    let display =
+                                        truncated_tab_title(ui, &title, &font, title_space);
+                                    ui.painter().text(
+                                        Pos2::new(rect.min.x + 12.0, rect.center().y),
+                                        egui::Align2::LEFT_CENTER,
+                                        display,
+                                        font,
+                                        if selected {
+                                            visuals.text_color()
+                                        } else {
+                                            if visuals.dark_mode {
+                                                Color32::from_gray(190)
+                                            } else {
+                                                Color32::from_gray(60)
+                                            }
+                                        },
+                                    );
+                                    if dirty {
+                                        ui.painter().circle_filled(
+                                            Pos2::new(close_rect.min.x - 5.0, rect.center().y),
+                                            3.0,
+                                            visuals.selection.bg_fill,
+                                        );
+                                    }
+                                    if selected || hovered {
+                                        let center = close_rect.center();
+                                        let color = if close_response.hovered() {
+                                            visuals.text_color()
+                                        } else {
+                                            visuals.weak_text_color()
+                                        };
+                                        ui.painter().line_segment(
+                                            [
+                                                center + Vec2::new(-3.0, -3.0),
+                                                center + Vec2::new(3.0, 3.0),
+                                            ],
+                                            Stroke::new(1.5_f32, color),
+                                        );
+                                        ui.painter().line_segment(
+                                            [
+                                                center + Vec2::new(-3.0, 3.0),
+                                                center + Vec2::new(3.0, -3.0),
+                                            ],
+                                            Stroke::new(1.5_f32, color),
+                                        );
+                                    }
+                                    let path = d
+                                        .path
+                                        .as_ref()
+                                        .map(|path| path.display().to_string())
+                                        .unwrap_or_else(|| title.clone());
+                                    let tab_response = tab_response.on_hover_text(path);
+                                    if close_response.clicked() {
+                                        actions.push(Action::Close(p.id, i));
+                                    } else if tab_response.clicked()
+                                        && !ui.input(|input| {
+                                            input
+                                                .pointer
+                                                .interact_pos()
+                                                .is_some_and(|pos| close_rect.contains(pos))
+                                        })
+                                    {
                                         p.active = i;
                                         actions.push(Action::Focus(p.id));
-                                    }
-                                    if ui.small_button("×").clicked() {
-                                        actions.push(Action::Close(p.id, i));
                                     }
                                 }
                             }
                         });
                     });
+                ui.add_space(3.0);
                 ui.separator();
                 if let Some(v) = p.tabs.get_mut(p.active) {
                     if let Some(d) = docs.get_mut(&v.document) {
@@ -1361,6 +1552,7 @@ fn replace_selected_match(
     view.anchor = None;
     view.observed_revision = document.revision;
     view.typing_until = None;
+    view.preferred_column = None;
     view.reveal = true;
     true
 }
@@ -1388,6 +1580,9 @@ fn replace_next_match(
     replace_selected_match(view, document, query, replacement, match_case)
 }
 fn sync_view(view: &mut View, document: &Document) {
+    if view.observed_revision != document.revision {
+        view.preferred_column = None;
+    }
     if let Some(changes) = document.changes_since(view.observed_revision) {
         for (start, removed, inserted) in changes {
             view.cursor = transform_position(view.cursor, start, removed, inserted);
@@ -1461,6 +1656,22 @@ fn insert(v: &mut View, d: &mut Document, text: &str) {
     v.reveal = true;
 }
 
+fn move_vertical(view: &mut View, document: &Document, target_line: usize) {
+    let column = *view
+        .preferred_column
+        .get_or_insert_with(|| view.cursor - document.line_start(document.line_of(view.cursor)));
+    let text = document.line_text(target_line);
+    let end = text.chars().count();
+    let target = column.min(end);
+    // Snap down to a grapheme boundary, keeping combining marks and emoji intact.
+    let target = if target < end {
+        prev_grapheme(&text, target + 1)
+    } else {
+        target
+    };
+    view.cursor = document.line_start(target_line) + target;
+}
+
 #[allow(clippy::too_many_arguments)]
 fn editor(
     ui: &mut egui::Ui,
@@ -1493,6 +1704,7 @@ fn editor(
     if response.clicked() || response.drag_started() {
         d.end_undo_group();
         v.typing_until = None;
+        v.preferred_column = None;
         response.request_focus();
         actions.push(Action::Focus(pane));
     }
@@ -1519,6 +1731,22 @@ fn editor(
         vec![]
     };
     for event in events {
+        let resets_column = match &event {
+            egui::Event::Key {
+                key, pressed: true, ..
+            } => !matches!(
+                key,
+                Key::ArrowUp | Key::ArrowDown | Key::PageUp | Key::PageDown
+            ),
+            egui::Event::Text(_)
+            | egui::Event::Paste(_)
+            | egui::Event::Cut
+            | egui::Event::Ime(egui::ImeEvent::Commit(_)) => true,
+            _ => false,
+        };
+        if resets_column {
+            v.preferred_column = None;
+        }
         let breaks_typing = matches!(
             &event,
             egui::Event::Copy | egui::Event::Cut | egui::Event::Paste(_)
@@ -1642,7 +1870,9 @@ fn editor(
                 let col = v.cursor - start;
                 match key {
                     Key::ArrowLeft => {
-                        if col > 0 {
+                        if !settings.vim && !modifiers.shift && !selection(v).is_empty() {
+                            v.cursor = selection(v).start;
+                        } else if col > 0 {
                             v.cursor = start + prev_grapheme(&text, col);
                         } else if line > 0 {
                             v.cursor =
@@ -1650,7 +1880,9 @@ fn editor(
                         }
                     }
                     Key::ArrowRight => {
-                        if col < text.chars().count() {
+                        if !settings.vim && !modifiers.shift && !selection(v).is_empty() {
+                            v.cursor = selection(v).end;
+                        } else if col < text.chars().count() {
                             v.cursor = start + next_grapheme(&text, col);
                         } else if line + 1 < d.line_count() {
                             v.cursor = d.line_start(line + 1);
@@ -1667,8 +1899,7 @@ fn editor(
                         } else {
                             (line + delta).min(d.line_count() - 1)
                         };
-                        v.cursor =
-                            d.line_start(target) + col.min(d.line_text(target).chars().count());
+                        move_vertical(v, d, target);
                     }
                     Key::Home => v.cursor = if modifiers.ctrl { 0 } else { start },
                     Key::End => {
@@ -1749,6 +1980,7 @@ fn editor(
         }
     }
     let gutter = 52.0;
+    let caret_visible = crate::caret::visible(ui.ctx(), id, focused);
     v.observed_revision = d.revision;
     let mut selected = selection(v);
     if settings.vim && v.vim.mode == VimMode::Visual {
@@ -1864,7 +2096,7 @@ fn editor(
                 let caret =
                     Rect::from_min_size(Pos2::new(x, row.min.y), Vec2::new(2.0, row_height));
                 cursor_rect = Some(caret);
-                if focused {
+                if caret_visible {
                     if settings.vim && v.vim.mode != VimMode::Insert {
                         ui.painter().rect_stroke(
                             Rect::from_min_size(
@@ -1949,6 +2181,147 @@ fn editor(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn terminal_chooser_and_session_have_independent_readable_heights() {
+        let ctx = egui::Context::default();
+        let mut heights = Vec::new();
+        for session in [false, true, false] {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1000.0, 760.0))),
+                    ..Default::default()
+                },
+                |ctx| {
+                    let panel = terminal_panel(session).show(ctx, |ui| {
+                        ui.set_min_height(ui.available_height());
+                        ui.label("TERMINAL");
+                    });
+                    heights.push(panel.response.rect.height());
+                    egui::CentralPanel::default().show(ctx, |_| {});
+                },
+            );
+        }
+        assert!(heights[0] <= 60.0);
+        assert!(heights[1] >= 270.0);
+        assert!(heights[2] <= 60.0);
+    }
+
+    #[test]
+    fn tabs_expand_for_a_few_files_and_keep_a_scrollable_minimum() {
+        assert_eq!(tab_width(800.0, 1), TAB_MAX_WIDTH);
+        assert_eq!(tab_width(360.0, 2), 178.0);
+        assert_eq!(tab_width(360.0, 8), TAB_MIN_WIDTH);
+    }
+
+    fn navigation_frame(
+        ctx: &egui::Context,
+        view: &mut View,
+        document: &mut Document,
+        syntax: &mut Highlighter,
+        events: Vec<egui::Event>,
+    ) {
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0))),
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    editor(
+                        ui,
+                        1,
+                        view,
+                        document,
+                        &Settings::default(),
+                        syntax,
+                        true,
+                        false,
+                        &mut vec![],
+                    );
+                });
+            },
+        );
+    }
+    #[test]
+    fn vertical_navigation_remembers_column_and_horizontal_motion_resets_it() {
+        let ctx = egui::Context::default();
+        let mut document = Document::new(1);
+        document.replace(0..0, "abcdef\r\nx\r\nabcdef");
+        let mut view = View::new(1);
+        view.cursor = 5;
+        view.observed_revision = document.revision;
+        let mut syntax = Highlighter::new();
+        navigation_frame(&ctx, &mut view, &mut document, &mut syntax, vec![]);
+        for (key, line, column) in [
+            (Key::ArrowDown, 1, 1),
+            (Key::ArrowDown, 2, 5),
+            (Key::ArrowUp, 1, 1),
+            (Key::ArrowUp, 0, 5),
+            (Key::ArrowLeft, 0, 4),
+            (Key::ArrowDown, 1, 1),
+            (Key::ArrowDown, 2, 4),
+        ] {
+            navigation_frame(
+                &ctx,
+                &mut view,
+                &mut document,
+                &mut syntax,
+                vec![key_event(key, egui::Modifiers::NONE)],
+            );
+            assert_eq!(view.cursor, document.line_start(line) + column);
+        }
+    }
+    #[test]
+    fn vertical_navigation_never_splits_emoji_or_combining_marks() {
+        let ctx = egui::Context::default();
+        let mut document = Document::new(1);
+        document.replace(0..0, "ab\n👩‍🚀x\ne\u{301}x\nab");
+        let mut view = View::new(1);
+        view.cursor = 1;
+        view.observed_revision = document.revision;
+        let mut syntax = Highlighter::new();
+        navigation_frame(&ctx, &mut view, &mut document, &mut syntax, vec![]);
+        for (line, column) in [(1, 0), (2, 0), (3, 1)] {
+            navigation_frame(
+                &ctx,
+                &mut view,
+                &mut document,
+                &mut syntax,
+                vec![key_event(Key::ArrowDown, egui::Modifiers::SHIFT)],
+            );
+            assert_eq!(view.cursor, document.line_start(line) + column);
+            assert_eq!(view.anchor, Some(1));
+        }
+    }
+    #[test]
+    fn horizontal_arrows_collapse_selection_without_an_extra_step() {
+        let ctx = egui::Context::default();
+        let mut document = Document::new(1);
+        document.replace(0..0, "abcdef");
+        let mut view = View::new(1);
+        view.observed_revision = document.revision;
+        let mut syntax = Highlighter::new();
+        navigation_frame(&ctx, &mut view, &mut document, &mut syntax, vec![]);
+        for (cursor, anchor, key, expected) in [
+            (4, 1, Key::ArrowLeft, 1),
+            (1, 4, Key::ArrowLeft, 1),
+            (4, 1, Key::ArrowRight, 4),
+            (1, 4, Key::ArrowRight, 4),
+        ] {
+            view.cursor = cursor;
+            view.anchor = Some(anchor);
+            navigation_frame(
+                &ctx,
+                &mut view,
+                &mut document,
+                &mut syntax,
+                vec![key_event(key, egui::Modifiers::NONE)],
+            );
+            assert_eq!(view.cursor, expected);
+            assert_eq!(view.anchor, None);
+        }
+    }
     fn key_event(key: Key, modifiers: egui::Modifiers) -> egui::Event {
         egui::Event::Key {
             key,

@@ -1,5 +1,7 @@
 # Rust tour through Twill
 
+`src/caret.rs` shares a small `Blink` state machine between the editor and terminal. Its `update` method returns a tuple containing visibility and the delay until the next transition. egui stores one state per widget ID, so each view keeps independent timing. `request_repaint_after` schedules the next blink without a rendering loop. The timing test supplies explicit times rather than sleeping.
+
 This guide explains Rust through the current Twill source. It describes code structure and selected invariants, not proof that every interactive path has been exercised.
 
 ## Ownership and borrowing: one document, many views
@@ -15,6 +17,12 @@ The document text is a `ropey::Rope`. `Highlighter::request` in [`src/syntax.rs`
 `Layout` in `src/app.rs` is either a `Leaf(Pane)` or a `Split` with two boxed layouts. This recursive type models nested panes directly. `match` handles each shape when searching, splitting, removing, or drawing panes. The command prompt supports `w`, `q`, `q!`, `wq`, and line-number navigation; splits are created through the View menu.
 
 Other examples include `VimMode` (`Normal`, `Insert`, `Visual`, `VisualLine`) in [`src/vim.rs`](../src/vim.rs), and `Shell` (`PowerShell`, `CommandPrompt`, `Wsl`) in [`src/terminal.rs`](../src/terminal.rs). The app's `Action` enum carries requests such as opening a path, saving, splitting, searching, or focusing a pane. Explicit variants make these supported states visible in the code.
+
+## Retaining a vertical cursor column
+
+Each `View` stores `preferred_column: Option<usize>`. `move_vertical` initializes it with `Option::get_or_insert_with`, using the cursor's character offset from the current line start. Later Up, Down, Page Up, or Page Down movements reuse that value even when a short line clamps the visible cursor closer to the line start. This avoids losing the intended column while traversing uneven lines.
+
+The stored column counts Unicode scalar values, not tab-expanded columns or rendered pixels. On a destination line, the cursor is snapped down to a grapheme boundary with `prev_grapheme`, so it will not land inside a combining sequence or emoji cluster. Horizontal keys, edits, pointer placement, searches, and document revision changes reset the saved column. With Vim disabled, Left and Right collapse a selection to its start or end respectively, independent of which direction the selection was made, without moving one more character.
 
 ## `Result` for file and process failures
 
@@ -46,6 +54,8 @@ Recovery serialization in [`src/platform.rs`](../src/platform.rs) shows how life
 
 Undo edits live in a `VecDeque<Edit>`. Each edit's budget includes the `Edit` struct itself and the allocated capacities of its before and after strings. Old records are evicted from the front while the 16 MiB limit is exceeded, retaining at least one edit.
 
+The Vim implementation also shows why movement and text ranges need line and grapheme boundaries. Counted `x` removes up to the current line end by repeatedly calling `next_grapheme`, so it does not consume a newline or split a combined character. Append (`a`) advances only as far as the current line end, including for an empty line. Leaving Insert with Escape moves back one grapheme but clamps that move at the current line's start, preventing it from crossing the preceding newline.
+
 ## Tests exercise focused invariants
 
-Unit tests in `src/document.rs` cover saved-state undo, grapheme navigation, BOM and newline preservation, external edit detection, and the change journal. `src/search.rs` tests Unicode offset mapping, repeated prefixes, wrapping, and literal matching. `src/terminal.rs` tests key encoding, colors, and cursor-query parsing; a Windows-only integration test starts a real Command Prompt through `Terminal::spawn` and checks output, resize, and shutdown. `src/platform.rs` tests recovery round trips and failure cleanup. `src/syntax.rs` checks the bundled syntax set, rendered line breaks, and worker result handling. The current offline suite passed 37 tests with 0 failures and 0 ignored tests. Formatting, Clippy with warnings denied, and the offline release build passed. These focused tests do not cover every interactive UI workflow, recovery scenario, or shell configuration.
+Unit tests in `src/document.rs` cover saved-state undo, grapheme navigation, BOM and newline preservation, external edit detection, and the change journal. `src/search.rs` tests Unicode offset mapping, repeated prefixes, wrapping, and literal matching. `src/terminal.rs` tests key encoding, colors, and cursor-query parsing; a Windows-only integration test starts a real Command Prompt through `Terminal::spawn` and checks output, resize, and shutdown. `src/platform.rs` tests recovery round trips and failure cleanup. `src/syntax.rs` checks the bundled syntax set, rendered line breaks, and worker result handling. These focused tests do not cover every interactive UI workflow, recovery scenario, or shell configuration.
